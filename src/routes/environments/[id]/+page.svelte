@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import AccessPanel from '#lib/components/AccessPanel.svelte';
+	import PolicyEditor from '#lib/components/PolicyEditor.svelte';
 	import type { ProbeResult } from '#lib/types.ts';
 	import type { PageProps } from './$types';
 
@@ -94,6 +95,8 @@
 					</table>
 				{/if}
 			</section>
+
+			{#key env.id}<PolicyEditor envId={env.id} />{/key}
 
 			<section class="box">
 				<h2 class="pad">Chats</h2>

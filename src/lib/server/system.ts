@@ -66,6 +66,8 @@ export function parseEnvironmentInput(body: unknown): EnvironmentInput {
 	if (!workspace) throw new Error('Workspace folder is required');
 	if (!workspace.startsWith('/') && !workspace.startsWith('~')) throw new Error('Workspace must be an absolute path (or start with ~)');
 	if (!isHarnessId(b.harness)) throw new Error('Pick a coding agent');
+	if (b.policyFile?.mode === 'custom' && !String(b.policyFile?.path ?? '').trim())
+		throw new Error('Enter the path of the custom policy file');
 	const fsIn = b.filesystem ?? {};
 	const net = b.network ?? {};
 	const credentials = (Array.isArray(b.credentials) ? b.credentials : []).map((c: any) => {
@@ -95,6 +97,11 @@ export function parseEnvironmentInput(body: unknown): EnvironmentInput {
 			packageManagers: !!net.packageManagers,
 			harnessDefaults: net.harnessDefaults !== false,
 			allowLocalBinding: !!net.allowLocalBinding
+		},
+		policyFile: {
+			mode: ['auto', 'custom', 'off'].includes(b.policyFile?.mode) ? b.policyFile.mode : 'auto',
+			path: String(b.policyFile?.path ?? '').trim(),
+			addAgentNeeds: b.policyFile?.addAgentNeeds !== false
 		},
 		credentials
 	};

@@ -60,6 +60,31 @@ export interface NetworkConfig {
 	allowLocalBinding: boolean;
 }
 
+/** Where the sandbox policy comes from. */
+export type PolicyFileMode =
+	/** Use <workspace>/.srt-settings.json, else ~/.srt-settings.json, else the form. */
+	| 'auto'
+	/** Use the file at `path` (it must exist). */
+	| 'custom'
+	/** Always use the environment form. */
+	| 'off';
+
+export type PolicyFileSource = 'project' | 'global' | 'custom';
+
+export interface PolicyFileConfig {
+	mode: PolicyFileMode;
+	/** Custom file path (absolute, ~/…, or relative to the workspace). */
+	path: string;
+	/** Add the agent's config folders and model API domains on top of the file. */
+	addAgentNeeds: boolean;
+}
+
+export interface PolicyCandidate {
+	source: PolicyFileSource;
+	path: string;
+	exists: boolean;
+}
+
 export interface EnvironmentView {
 	id: string;
 	name: string;
@@ -69,6 +94,7 @@ export interface EnvironmentView {
 	model: string;
 	filesystem: FilesystemConfig;
 	network: NetworkConfig;
+	policyFile: PolicyFileConfig;
 	credentials: CredentialView[];
 	createdAt: string;
 	updatedAt: string;
@@ -81,11 +107,12 @@ export interface EnvironmentInput {
 	model: string;
 	filesystem: FilesystemConfig;
 	network: NetworkConfig;
+	policyFile: PolicyFileConfig;
 	credentials: CredentialInput[];
 }
 
 /** Why an entry is in the effective policy. */
-export type AccessSource = 'workspace' | 'you' | 'agent' | 'packages' | 'default' | 'runtime';
+export type AccessSource = 'workspace' | 'you' | 'agent' | 'packages' | 'default' | 'runtime' | 'file';
 
 export interface AccessEntry {
 	value: string;
@@ -113,9 +140,31 @@ export interface AccessReport {
 		masked: AccessEntry[];
 		missing: AccessEntry[];
 	};
+	/** Where the rules come from. */
+	policy: {
+		source: 'form' | PolicyFileSource;
+		/** Path of the policy file in use. */
+		path?: string;
+		/** Top-level settings from the file that are passed through unchanged. */
+		otherKeys: string[];
+	};
+	/** Hash of the effective srt settings. Changes whenever the sandbox would change. */
+	hash: string;
+	/** Set when the sandbox must not start (for example an invalid policy file). */
+	blocked: string | null;
 	/** Raw sandbox-runtime settings (secrets are never included). */
 	srtSettings: unknown;
 	warnings: string[];
+}
+
+export interface PolicyFileState {
+	mode: PolicyFileMode;
+	candidates: PolicyCandidate[];
+	active: (PolicyCandidate & { content: string; errors: string[] }) | null;
+	/** A starting point built from the environment form, for creating a new file. */
+	starter: string;
+	/** Hash of the effective srt settings (same as AccessReport.hash). */
+	hash: string;
 }
 
 export interface HarnessInfo {

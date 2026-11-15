@@ -18,6 +18,15 @@ export const POST = async ({ request }) => {
 
 	const controller = new AbortController();
 	request.signal.addEventListener('abort', () => controller.abort(), { once: true });
-	const stream = runAgent({ env, session, messages: params.messages as never, signal: controller.signal });
+	let stream;
+	try {
+		stream = runAgent({ env, session, messages: params.messages as never, signal: controller.signal });
+	} catch (e) {
+		// Report setup problems (such as an invalid policy file) in the chat itself.
+		const message = e instanceof Error ? e.message : String(e);
+		stream = (async function* () {
+			yield { type: 'RUN_ERROR', timestamp: Date.now(), message };
+		})();
+	}
 	return toServerSentEventsResponse(stream as never, { abortController: controller });
 };

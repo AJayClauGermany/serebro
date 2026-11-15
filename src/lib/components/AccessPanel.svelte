@@ -11,7 +11,8 @@
 		agent: 'agent',
 		packages: 'packages',
 		default: 'default',
-		runtime: 'serebro'
+		runtime: 'serebro',
+		file: 'policy file'
 	};
 </script>
 
@@ -37,6 +38,20 @@
 	{#if !report}
 		<p class="pad muted">Fill in the form to see the effective access.</p>
 	{:else}
+		<div class="policy-src small">
+			Rules from:
+			{#if report.policy.source === 'form'}
+				<strong>this environment's settings</strong>
+			{:else}
+				<strong>{report.policy.source} policy file</strong> <code>{report.policy.path}</code>
+				{#if report.policy.otherKeys.length}
+					<div class="muted">Also passed through from the file: {report.policy.otherKeys.join(', ')}</div>
+				{/if}
+			{/if}
+		</div>
+		{#if report.blocked}
+			<div class="pad"><div class="error small blocked">{report.blocked}</div></div>
+		{/if}
 		{#if report.warnings.length}
 			<div class="pad warnlist">
 				{#each report.warnings as w}<div class="notice small">⚠ {w}</div>{/each}
@@ -110,5 +125,7 @@
 	.src { font: 700 0.65rem var(--sans); text-transform: uppercase; border: 1px solid var(--line); padding: 0 4px; margin-left: 6px; color: var(--muted); }
 	.note { font-size: 0.8rem; color: var(--muted); word-break: normal; }
 	.warnlist { display: flex; flex-direction: column; gap: 6px; border-bottom: 2px solid var(--line); }
+	.policy-src { padding: 10px 16px; border-bottom: 2px solid var(--line); word-break: break-all; }
+	.blocked { white-space: pre-wrap; }
 	.raw { font: 0.75rem var(--mono); overflow: auto; max-height: 320px; background: var(--bg); border: 2px solid var(--line); padding: 8px; }
 </style>

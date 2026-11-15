@@ -46,6 +46,25 @@ The home page lists anything missing.
 
 The access panel and the enforced sandbox settings are built by one function (`src/lib/server/policy.ts`), so what you see is what runs. Expand **Raw sandbox-runtime settings** to see the exact config.
 
+## Using your own policy file
+
+If you already have a sandbox-runtime config, Serebro can use it instead of the Files and Network settings. Each environment has a **Policy file** setting:
+
+| Mode | What it uses |
+|---|---|
+| **Auto** (default) | `<workspace>/.srt-settings.json` if it exists, else `~/.srt-settings.json` (srt's own default file), else the environment settings |
+| **Custom** | A file you name (absolute, `~/…`, or relative to the workspace). If it is missing, the sandbox will not start. |
+| **Off** | Always use the environment settings |
+
+When a file is in use:
+
+- Its rules replace the Files and Network settings. Other keys (`ignoreViolations`, `allowUnixSockets`, …) pass through unchanged.
+- By default Serebro adds the agent's config folders and model API domain on top (you can turn this off). It always adds a private temp folder, hides its own data folder, and blocks writes to every policy file, so **the agent cannot change its own rules**.
+- Credentials still come from Serebro. Keys don't belong in a file that might be committed.
+- The file is validated against srt's schema before every run. If it's invalid, the run stops with the error and nothing starts without a sandbox.
+
+**Editing:** the environment page has an editor. It shows which file is in use, can create a project or global file from the current settings, and validates before saving. Edits made in your own editor are picked up too. Every agent message starts a fresh sandboxed process, so changes apply from the next message. Open chats show a **Sandbox policy changed** bar with **Reload sandbox**, which also stops a running turn.
+
 ## How it works
 
 ```
@@ -67,7 +86,7 @@ Everything is stored in `./.serebro` (change it with `SEREBRO_DATA_DIR`):
 - `environments.json`: environment configs, with no secrets
 - `secrets.json`: credential values (file mode 0600). They are never sent to the browser, and the sandbox cannot read this folder.
 - `sessions.json`, `messages/`: chats
-- `sandboxes/<id>/srt-settings.json`: generated sandbox config
+- `sandboxes/<id>/srt-settings.json`: generated sandbox config (the effective one, including Serebro's additions)
 
 Serebro has no login. Run it on `localhost` only.
 

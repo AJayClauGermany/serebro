@@ -57,8 +57,13 @@ function writeJson(name: string, data: unknown, mode = 0o600) {
 
 // ---------- environments ----------
 
+export const DEFAULT_POLICY_FILE = { mode: 'auto', path: '', addAgentNeeds: true } as const;
+
 export function listEnvironments(): StoredEnvironment[] {
-	return readJson<StoredEnvironment[]>('environments.json', []);
+	return readJson<StoredEnvironment[]>('environments.json', []).map((e) => ({
+		...e,
+		policyFile: { ...DEFAULT_POLICY_FILE, ...e.policyFile }
+	}));
 }
 
 export function getEnvironment(id: string): StoredEnvironment | undefined {

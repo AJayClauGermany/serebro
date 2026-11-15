@@ -7,6 +7,7 @@ import path from 'node:path';
 import type { AccessEntry, AccessReport } from '#lib/types.ts';
 import { getHarness, which } from './harnesses';
 import { DATA_DIR, getSecrets, sandboxDir, type StoredEnvironment } from './store';
+import { expandHome, hashText, policyCandidates, resolvePolicyFile, workspacePath } from './policy-file.ts';
 
 /** Folders that hold credentials on most machines. Pre-filled into new environments. */
 export const RECOMMENDED_DENY_READ = [
@@ -56,53 +57,100 @@ function uniq(entries: AccessEntry[]): AccessEntry[] {
 	});
 }
 
-function expandHome(p: string) {
-	return p === '~' ? os.homedir() : p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p;
-}
-
 export function tmpDirFor(envId: string) {
 	return path.join(os.tmpdir(), `serebro-${envId}`);
+}
+
+type FsEntry = string | { path: string; literal: true };
+
+const entryPath = (e: unknown) => (typeof e === 'string' ? e : (e as { path?: string })?.path ?? '');
+const asList = (v: unknown): FsEntry[] => (Array.isArray(v) ? (v as FsEntry[]) : []);
+
+/** The policy files Serebro may read. The agent can never create or change them. */
+function protectedPolicyFiles(env: StoredEnvironment): AccessEntry[] {
+	return policyCandidates(env).map((c) => ({
+		value: c.path,
+		source: 'runtime',
+		note: `Sandbox policy file (${c.source}) — the agent cannot change its own rules`
+	}));
 }
 
 export function compilePolicy(env: StoredEnvironment, secrets = getSecrets(env.id)): CompiledPolicy {
 	const harness = getHarness(env.harness);
 	const warnings: string[] = [];
 	const tmpDir = tmpDirFor(env.id);
-	const workspace = path.resolve(expandHome(env.workspace));
+	const workspace = workspacePath(env);
+	const resolved = resolvePolicyFile(env);
+	const file = resolved.active;
+	const fromFile = !!file;
+	let blocked: string | null = null;
+	if (file && !file.validation.ok) {
+		blocked = `Policy file ${file.path} is invalid, so the sandbox will not start:\n${file.validation.errors.join('\n')}`;
+	}
+	const fileConfig: Record<string, any> = file?.validation.config ?? {};
+	const addAgent = fromFile ? env.policyFile?.addAgentNeeds !== false : true;
+	const src: AccessEntry['source'] = 'file';
 
-	// ---- filesystem ----
-	const readWrite = uniq([
-		{ value: workspace, source: 'workspace', note: 'Project folder' },
-		...env.filesystem.readWrite.map((v): AccessEntry => ({ value: v, source: 'you' })),
-		...harness.writePaths.map((v): AccessEntry => ({ value: v, source: 'agent', note: `${harness.label} config and session files` })),
-		{ value: tmpDir, source: 'runtime', note: 'Private temp folder (TMPDIR)' }
-	]);
-	const denyRead = uniq([
-		...env.filesystem.denyRead.map(
-			(v): AccessEntry => ({ value: v, source: RECOMMENDED_DENY_READ.includes(v) ? 'default' : 'you' })
-		),
-		{ value: DATA_DIR, source: 'runtime', note: 'Serebro data folder (holds your stored keys)' }
-	]);
-	const allowRead = uniq(env.filesystem.allowRead.map((v): AccessEntry => ({ value: v, source: 'you' })));
-	const denyWrite = uniq([
-		...env.filesystem.denyWrite.map((v): AccessEntry => ({ value: v, source: 'you' })),
-		{ value: DATA_DIR, source: 'runtime', note: 'Serebro data folder' }
-	]);
-
-	// ---- network ----
-	const allowed = uniq([
-		...env.network.allowedDomains.map((v): AccessEntry => ({ value: v, source: 'you' })),
-		...(env.network.harnessDefaults
+	// Agent and Serebro additions, the same in both modes.
+	const agentWrites = addAgent
+		? harness.writePaths.map((v): AccessEntry => ({ value: v, source: 'agent', note: `${harness.label} config and session files` }))
+		: [];
+	const runtimeWrites: AccessEntry[] = [{ value: tmpDir, source: 'runtime', note: 'Private temp folder (TMPDIR)' }];
+	const runtimeDenyRead: AccessEntry[] = [{ value: DATA_DIR, source: 'runtime', note: 'Serebro data folder (holds your stored keys)' }];
+	const runtimeDenyWrite: AccessEntry[] = [
+		{ value: DATA_DIR, source: 'runtime', note: 'Serebro data folder' },
+		...protectedPolicyFiles(env)
+	];
+	const agentDomains =
+		(fromFile ? addAgent : env.network.harnessDefaults)
 			? harness.domains.map((v): AccessEntry => ({ value: v, source: 'agent', note: `${harness.label} model API` }))
-			: []),
-		...(env.network.packageManagers
-			? PACKAGE_MANAGER_DOMAINS.map((v): AccessEntry => ({ value: v, source: 'packages' }))
-			: [])
-	]);
-	const denied = uniq(env.network.deniedDomains.map((v): AccessEntry => ({ value: v, source: 'you' })));
-	const localBinding = env.network.allowLocalBinding || env.harness === 'opencode';
+			: [];
 
-	// ---- credentials ----
+	// ---- filesystem + network: from the file, or from the form ----
+	let readWrite: AccessEntry[], denyRead: AccessEntry[], allowRead: AccessEntry[], denyWrite: AccessEntry[];
+	let allowed: AccessEntry[], denied: AccessEntry[], localBinding: boolean;
+	const fsIn = fileConfig.filesystem ?? {};
+	const netIn = fileConfig.network ?? {};
+	if (fromFile) {
+		const fromList = (v: unknown) => asList(v).map((e): AccessEntry => ({ value: entryPath(e), source: src }));
+		readWrite = uniq([...fromList(fsIn.allowWrite), ...agentWrites, ...runtimeWrites]);
+		denyRead = uniq([...fromList(fsIn.denyRead), ...runtimeDenyRead]);
+		allowRead = uniq(fromList(fsIn.allowRead));
+		denyWrite = uniq([...fromList(fsIn.denyWrite), ...runtimeDenyWrite]);
+		allowed = uniq([...fromList(netIn.allowedDomains), ...agentDomains]);
+		denied = uniq(fromList(netIn.deniedDomains));
+		localBinding = !!netIn.allowLocalBinding;
+		const writable = asList(fsIn.allowWrite).map((e) => path.resolve(workspace, expandHome(entryPath(e))));
+		if (!writable.some((w) => workspace === w || workspace.startsWith(w + path.sep)))
+			warnings.push('The policy file does not make the workspace writable (add "." to filesystem.allowWrite). The agent will not be able to edit files.');
+	} else {
+		readWrite = uniq([
+			{ value: workspace, source: 'workspace', note: 'Project folder' },
+			...env.filesystem.readWrite.map((v): AccessEntry => ({ value: v, source: 'you' })),
+			...agentWrites,
+			...runtimeWrites
+		]);
+		denyRead = uniq([
+			...env.filesystem.denyRead.map(
+				(v): AccessEntry => ({ value: v, source: RECOMMENDED_DENY_READ.includes(v) ? 'default' : 'you' })
+			),
+			...runtimeDenyRead
+		]);
+		allowRead = uniq(env.filesystem.allowRead.map((v): AccessEntry => ({ value: v, source: 'you' })));
+		denyWrite = uniq([...env.filesystem.denyWrite.map((v): AccessEntry => ({ value: v, source: 'you' })), ...runtimeDenyWrite]);
+		allowed = uniq([
+			...env.network.allowedDomains.map((v): AccessEntry => ({ value: v, source: 'you' })),
+			...agentDomains,
+			...(env.network.packageManagers
+				? PACKAGE_MANAGER_DOMAINS.map((v): AccessEntry => ({ value: v, source: 'packages' }))
+				: [])
+		]);
+		denied = uniq(env.network.deniedDomains.map((v): AccessEntry => ({ value: v, source: 'you' })));
+		localBinding = env.network.allowLocalBinding;
+	}
+	if (env.harness === 'opencode') localBinding = true;
+
+	// ---- credentials (always from Serebro: keys do not belong in a policy file) ----
 	const childEnv: Record<string, string> = { ...harness.env, TMPDIR: tmpDir, TMP: tmpDir, TEMP: tmpDir };
 	const direct: AccessEntry[] = [];
 	const masked: AccessEntry[] = [];
@@ -135,30 +183,52 @@ export function compilePolicy(env: StoredEnvironment, secrets = getSecrets(env.i
 			missing.push({ value: name, source: 'agent', note: `${harness.label} usually needs this` });
 		}
 	}
+	const fileCreds = fileConfig.credentials ?? {};
+	const fileMaskedEnv = asList(fileCreds.envVars) as unknown as Array<{ name: string }>;
+	for (const v of fileMaskedEnv) masked.push({ value: v.name, source: 'file', note: 'Masked by the policy file' });
 
 	// ---- warnings ----
 	if (!fs.existsSync(workspace)) warnings.push(`Workspace folder does not exist: ${workspace}`);
 	if (!which(harness.binary)) warnings.push(`${harness.label} is not installed (\`${harness.binary}\` not on PATH). Install: ${harness.installHint}`);
 	if (env.harness === 'opencode' && os.platform() === 'linux')
 		warnings.push('OpenCode needs host-to-sandbox networking, which the Linux sandbox does not provide yet.');
-	if (!env.network.harnessDefaults && harness.domains.length)
+	if (!agentDomains.length && harness.domains.length && !harness.domains.every((d) => allowed.some((a) => a.value === d)))
 		warnings.push(`Agent API domains are off. ${harness.label} cannot reach ${harness.domains.join(', ')} unless you add them.`);
 
 	// ---- sandbox-runtime settings ----
+	// Paths keep the file's original form (including { path, literal } entries); additions are appended.
+	const keepOrAdd = (orig: unknown, entries: AccessEntry[]): FsEntry[] => {
+		const out = fromFile ? [...asList(orig)] : [];
+		const have = new Set(out.map(entryPath));
+		for (const e of entries) if (!have.has(e.value)) out.push(e.value);
+		return out;
+	};
+	const denyWriteOut = keepOrAdd(fsIn.denyWrite, denyWrite).map((e) =>
+		typeof e === 'string' && runtimeDenyWrite.some((r) => r.value === e && r.note?.startsWith('Sandbox policy file'))
+			? { path: e, literal: true as const }
+			: e
+	);
+	const tlsNeeded = maskedEnvVars.length > 0;
+	const { network: _n, filesystem: _f, credentials: _c, ...otherFileKeys } = fileConfig;
 	const settings: Record<string, unknown> = {
+		...otherFileKeys,
 		network: {
-			allowedDomains: allowed.map((e) => e.value),
-			deniedDomains: denied.map((e) => e.value),
+			...netIn,
+			allowedDomains: keepOrAdd(netIn.allowedDomains, allowed),
+			deniedDomains: keepOrAdd(netIn.deniedDomains, denied),
 			allowLocalBinding: localBinding,
-			...(maskedEnvVars.length ? { tlsTerminate: {} } : {})
+			...(tlsNeeded && !netIn.tlsTerminate ? { tlsTerminate: {} } : {})
 		},
 		filesystem: {
-			denyRead: denyRead.map((e) => e.value),
-			allowRead: allowRead.map((e) => e.value),
-			allowWrite: readWrite.map((e) => e.value),
-			denyWrite: denyWrite.map((e) => e.value)
+			...fsIn,
+			denyRead: keepOrAdd(fsIn.denyRead, denyRead),
+			allowRead: keepOrAdd(fsIn.allowRead, allowRead),
+			allowWrite: keepOrAdd(fsIn.allowWrite, readWrite),
+			denyWrite: denyWriteOut
 		},
-		...(maskedEnvVars.length ? { credentials: { envVars: maskedEnvVars } } : {})
+		...(tlsNeeded || fileMaskedEnv.length
+			? { credentials: { ...fileCreds, envVars: [...fileMaskedEnv, ...maskedEnvVars] } }
+			: {})
 	};
 
 	const report: AccessReport = {
@@ -177,11 +247,41 @@ export function compilePolicy(env: StoredEnvironment, secrets = getSecrets(env.i
 			note: 'All other network destinations are blocked. Traffic goes through a filtering proxy.'
 		},
 		credentials: { direct, masked, missing },
+		policy: file
+			? { source: file.source, path: file.path, otherKeys: Object.keys(otherFileKeys) }
+			: { source: 'form', otherKeys: [] },
+		hash: hashText(JSON.stringify(settings) + (blocked ?? '')),
+		blocked,
 		srtSettings: settings,
 		warnings
 	};
 
 	return { settings, report, env: childEnv, tmpDir };
+}
+
+/**
+ * A policy file built from the environment form, as a starting point. Serebro's own
+ * additions (temp folder, data folder, agent paths) are left out: they are added at run time.
+ */
+export function starterPolicy(env: StoredEnvironment): string {
+	const formEnv: StoredEnvironment = { ...env, policyFile: { ...env.policyFile, mode: 'off' } };
+	const { report } = compilePolicy(formEnv, {});
+	const pick = (list: AccessEntry[], drop: AccessEntry['source'][] = ['runtime']) =>
+		list.filter((e) => !drop.includes(e.source)).map((e) => (e.source === 'workspace' ? '.' : e.value));
+	const config = {
+		filesystem: {
+			allowWrite: pick(report.filesystem.readWrite),
+			denyRead: pick(report.filesystem.denyRead),
+			allowRead: pick(report.filesystem.allowRead),
+			denyWrite: pick(report.filesystem.denyWrite)
+		},
+		network: {
+			allowedDomains: pick(report.network.allowed, ['runtime']),
+			deniedDomains: pick(report.network.denied),
+			allowLocalBinding: env.network.allowLocalBinding
+		}
+	};
+	return JSON.stringify(config, null, 2) + '\n';
 }
 
 /** Write the srt settings file for an environment and return its path. */

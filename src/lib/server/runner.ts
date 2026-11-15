@@ -9,6 +9,7 @@ import { defineSandbox, withSandbox } from '@tanstack/ai-sandbox';
 import type { ProbeResult } from '#lib/types.ts';
 import { getHarness } from './harnesses';
 import { compilePolicy, writeSettings } from './policy';
+import { projectPolicyPath } from './policy-file.ts';
 import { DATA_DIR, patchSession, type StoredEnvironment } from './store';
 import { proxyEnv, shellQuote, srtSandbox, wrapCommand } from './srt-provider';
 import type { SessionView } from '#lib/types.ts';
@@ -27,6 +28,7 @@ export function runAgent(opts: {
 	const { env, session, messages, signal } = opts;
 	const harness = getHarness(session.harness);
 	const compiled = compilePolicy(env);
+	if (compiled.report.blocked) throw new Error(compiled.report.blocked);
 	const settingsFile = writeSettings(env, compiled);
 
 	const sandbox = defineSandbox({
@@ -88,6 +90,9 @@ function run(command: string, cwd: string, env: Record<string, string>, timeoutM
  */
 export async function probeEnvironment(env: StoredEnvironment): Promise<ProbeResult[]> {
 	const compiled = compilePolicy(env);
+	if (compiled.report.blocked) {
+		return [{ name: 'Policy file is valid', command: '', expect: 'allowed', outcome: 'blocked', pass: false, output: compiled.report.blocked }];
+	}
 	const settingsFile = writeSettings(env, compiled);
 	const cwd = resolveWorkspace(env);
 	if (!fs.existsSync(cwd)) {
@@ -109,6 +114,7 @@ export async function probeEnvironment(env: StoredEnvironment): Promise<ProbeRes
 		{ name: 'Writes inside the workspace', command: `touch ${marker} && rm ${marker}`, expect: 'allowed' },
 		{ name: 'Writes outside the workspace', command: `touch ${outside}`, expect: 'blocked' },
 		{ name: 'Reads the Serebro data folder', command: canSee(DATA_DIR), expect: 'blocked' },
+		{ name: 'Changes its own policy file', command: `touch ${shellQuote(projectPolicyPath(env))}`, expect: 'blocked' },
 		...(firstDenied
 			? [{ name: `Reads a denied path (${firstDenied})`, command: canSee(firstDenied.replace(/^~(?=$|\/)/, os.homedir())), expect: 'blocked' as const }]
 			: []),

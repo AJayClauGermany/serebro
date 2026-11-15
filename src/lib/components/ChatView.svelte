@@ -2,6 +2,7 @@
 	import { createChat, fetchServerSentEvents } from '@tanstack/ai-svelte';
 	import AccessPanel from './AccessPanel.svelte';
 	import { untrack } from 'svelte';
+	import { invalidateAll } from '$app/navigation';
 	import type { AccessReport, EnvironmentView, HarnessInfo, SessionView } from '#lib/types.ts';
 
 	let {
@@ -22,6 +23,32 @@
 	});
 
 	let input = $state('');
+
+	// Watch the effective sandbox policy. Each agent turn starts a fresh sandboxed process,
+	// so a change applies from the next message; "Reload" also stops a running turn.
+	let appliedHash = $state(untrack(() => data.access.hash));
+	let latestHash = $state(untrack(() => data.access.hash));
+	let latestBlocked = $state<string | null>(untrack(() => data.access.blocked));
+	const policyChanged = $derived(latestHash !== appliedHash);
+
+	$effect(() => {
+		const envId = data.environment.id;
+		const t = setInterval(async () => {
+			const res = await fetch(`/api/environments/${envId}/policy?hash`);
+			if (res.ok) {
+				const b = await res.json();
+				latestHash = b.hash;
+				latestBlocked = b.blocked;
+			}
+		}, 3000);
+		return () => clearInterval(t);
+	});
+
+	async function reloadSandbox() {
+		if (chat.isLoading) chat.stop();
+		await invalidateAll();
+		appliedHash = latestHash;
+	}
 	let scroller: HTMLElement | undefined = $state();
 
 	async function persist() {
@@ -37,6 +64,8 @@
 		const text = input.trim();
 		if (!text || chat.isLoading) return;
 		input = '';
+		if (policyChanged) reloadSandbox();
+		appliedHash = latestHash;
 		chat.sendMessage(text);
 	}
 
@@ -80,6 +109,18 @@
 			</div>
 			{#if chat.isLoading}<span class="tag acc">working…</span>{:else}<span class="tag ok">ready</span>{/if}
 		</header>
+
+		{#if policyChanged}
+			<div class="policy-bar spread">
+				<span>
+					<strong>Sandbox policy changed.</strong>
+					{#if latestBlocked}The new policy is invalid; fix it before the next message.
+					{:else if chat.isLoading}The running turn still uses the old rules.
+					{:else}It applies to your next message.{/if}
+				</span>
+				<button onclick={reloadSandbox}>{chat.isLoading ? '■ Stop & reload sandbox' : '↻ Reload sandbox'}</button>
+			</div>
+		{/if}
 
 		<div class="messages" bind:this={scroller}>
 			{#if chat.messages.length === 0}
@@ -145,7 +186,10 @@
 
 	<aside class="side">
 		<AccessPanel report={data.access} compact />
-		<a class="btn" href="/environments/{data.environment.id}/edit">Change access</a>
+		<div class="row">
+			<a class="btn" href="/environments/{data.environment.id}/edit">Change access</a>
+			<a class="btn" href="/environments/{data.environment.id}" target="_blank">Edit policy file ↗</a>
+		</div>
 		<p class="small muted">Changes apply from the next message.</p>
 	</aside>
 </main>
@@ -159,6 +203,7 @@
 	.chat { display: flex; flex-direction: column; min-height: 0; }
 	.chat-head { padding: 12px 16px; border-bottom: 2px solid var(--line); }
 	.chat-head code { word-break: break-all; }
+	.policy-bar { background: var(--warn-bg); border-bottom: 2px solid var(--line); padding: 8px 16px; }
 	.messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; min-height: 320px; }
 	.empty { margin: auto; text-align: center; max-width: 50ch; }
 	.msg { border: 2px solid var(--line); padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; max-width: 100%; }

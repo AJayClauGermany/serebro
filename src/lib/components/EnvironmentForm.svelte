@@ -48,6 +48,9 @@
 	let packageManagers = $state(init?.network.packageManagers ?? false);
 	let harnessDefaults = $state(init?.network.harnessDefaults ?? true);
 	let allowLocalBinding = $state(init?.network.allowLocalBinding ?? false);
+	let policyMode = $state(init?.policyFile.mode ?? 'auto');
+	let policyPath = $state(init?.policyFile.path ?? '');
+	let addAgentNeeds = $state(init?.policyFile.addAgentNeeds ?? true);
 	let credentials = $state<CredRow[]>(
 		init?.credentials.map((c) => ({ ...c, value: '' })) ??
 			[{ name: 'ANTHROPIC_API_KEY', mode: 'direct', injectHosts: [], value: '', hasValue: false, hint: '' }]
@@ -56,7 +59,8 @@
 	let saving = $state(false);
 	let error = $state('');
 	let report = $state<AccessReport | null>(null);
-	let openSection = $state<Record<string, boolean>>({ files: !init, network: false, creds: !init });
+	let openSection = $state<Record<string, boolean>>({ policy: false, files: !init, network: false, creds: !init });
+	const fileInUse = $derived(report && report.policy.source !== 'form' ? report.policy : null);
 
 	const current = $derived(harnesses.find((h) => h.id === harness)!);
 
@@ -85,6 +89,7 @@
 			model,
 			filesystem: { readWrite, denyRead, allowRead, denyWrite },
 			network: { allowedDomains, deniedDomains, packageManagers, harnessDefaults, allowLocalBinding },
+			policyFile: { mode: policyMode, path: policyPath, addAgentNeeds },
 			credentials: credentials.map((c) => ({
 				name: c.name,
 				mode: c.mode,
@@ -126,13 +131,24 @@
 	}
 
 	const fsSummary = $derived(
-		`${1 + readWrite.length} writable · ${denyRead.length} hidden · ${denyWrite.length} protected`
+		fileInUse
+			? `From ${fileInUse.source} policy file`
+			: `${1 + readWrite.length} writable · ${denyRead.length} hidden · ${denyWrite.length} protected`
+	);
+	const policySummary = $derived(
+		policyMode === 'off'
+			? 'Off · always use the settings below'
+			: fileInUse
+				? `Using ${fileInUse.path}`
+				: policyMode === 'custom'
+					? `Custom: ${policyPath || '(no path)'}`
+					: 'Auto · no .srt-settings.json found, using the settings below'
 	);
 	const netCount = $derived(
 		allowedDomains.length + (harnessDefaults ? current.domains.length : 0) + (packageManagers ? defaults.packageDomains.length : 0)
 	);
 	const netSummary = $derived(
-		`Limited · ${netCount} domain${netCount === 1 ? '' : 's'} · package managers ${packageManagers ? 'on' : 'off'}`
+		fileInUse ? `From ${fileInUse.source} policy file` : `Limited · ${netCount} domain${netCount === 1 ? '' : 's'} · package managers ${packageManagers ? 'on' : 'off'}`
 	);
 	const credSummary = $derived(
 		credentials.filter((c) => c.name).length === 0
@@ -192,6 +208,44 @@
 				{#each current.models as m}<option value={m}></option>{/each}
 			</datalist>
 		</label>
+
+		<Section title="Policy file" summary={policySummary} bind:open={openSection.policy}>
+			<div class="small muted">
+				Already have a sandbox-runtime config? Serebro can use it instead of the Files and Network settings below.
+				Credentials always come from this page.
+			</div>
+			<label class="check">
+				<input type="radio" bind:group={policyMode} value="auto" />
+				<span>
+					<strong>Auto</strong>: use <code>.srt-settings.json</code> in the workspace, else <code>~/.srt-settings.json</code>,
+					else the settings below
+				</span>
+			</label>
+			<label class="check">
+				<input type="radio" bind:group={policyMode} value="custom" />
+				<span><strong>Custom file</strong>: always use a file you choose</span>
+			</label>
+			{#if policyMode === 'custom'}
+				<input bind:value={policyPath} placeholder="~/policies/strict.json or sandbox/policy.json (relative to the workspace)" />
+			{/if}
+			<label class="check">
+				<input type="radio" bind:group={policyMode} value="off" />
+				<span><strong>Off</strong>: ignore policy files and use the settings below</span>
+			</label>
+			{#if policyMode !== 'off'}
+				<label class="check">
+					<input type="checkbox" bind:checked={addAgentNeeds} />
+					<span>When a file is used, also allow what {current.label} needs: <code>{[...current.domains, ...current.writePaths].join(', ')}</code></span>
+				</label>
+			{/if}
+			<div class="small muted">You can create and edit the file on the environment page after saving.</div>
+		</Section>
+
+		{#if fileInUse}
+			<div class="notice small">
+				Files and Network below are <strong>not used</strong>: the rules come from <code>{fileInUse.path}</code>.
+			</div>
+		{/if}
 
 		<Section title="Files" summary={fsSummary} bind:open={openSection.files}>
 			<div class="small muted">
