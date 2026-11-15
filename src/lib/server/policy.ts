@@ -57,8 +57,9 @@ function uniq(entries: AccessEntry[]): AccessEntry[] {
 	});
 }
 
+/** Private temp folder per environment, under the user's home (not a guessable shared /tmp path). */
 export function tmpDirFor(envId: string) {
-	return path.join(os.tmpdir(), `serebro-${envId}`);
+	return path.join(os.homedir(), '.cache', 'serebro', 'tmp', envId);
 }
 
 type FsEntry = string | { path: string; literal: true };
@@ -189,6 +190,8 @@ export function compilePolicy(env: StoredEnvironment, secrets = getSecrets(env.i
 
 	// ---- warnings ----
 	if (!fs.existsSync(workspace)) warnings.push(`Workspace folder does not exist: ${workspace}`);
+	if (workspace === os.homedir() || workspace === path.parse(workspace).root)
+		warnings.push(`The workspace is ${workspace}, so the agent can write almost everywhere. Pick a project folder instead.`);
 	if (!which(harness.binary)) warnings.push(`${harness.label} is not installed (\`${harness.binary}\` not on PATH). Install: ${harness.installHint}`);
 	if (env.harness === 'opencode' && os.platform() === 'linux')
 		warnings.push('OpenCode needs host-to-sandbox networking, which the Linux sandbox does not provide yet.');

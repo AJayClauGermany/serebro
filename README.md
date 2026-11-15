@@ -88,7 +88,16 @@ Everything is stored in `./.serebro` (change it with `SEREBRO_DATA_DIR`):
 - `sessions.json`, `messages/`: chats
 - `sandboxes/<id>/srt-settings.json`: generated sandbox config (the effective one, including Serebro's additions)
 
-Serebro has no login. Run it on `localhost` only.
+### Security
+
+Serebro has no login: anyone who can reach its API can run agents on your machine. So by default it only answers requests that:
+
+- come from this machine (loopback). Other machines on the network are refused.
+- use a local `Host` (`localhost`, `127.0.0.1`, `::1`). This blocks DNS-rebinding attacks.
+- come from Serebro's own pages, when the browser sends an `Origin`. Other websites are refused.
+- are JSON, for API writes. Browsers cannot send JSON cross-site without permission.
+
+To put it behind your own authenticating proxy, set `SEREBRO_ALLOWED_HOSTS=serebro.example.com` and `SEREBRO_ALLOW_REMOTE=1`.
 
 ## Known limitations
 
