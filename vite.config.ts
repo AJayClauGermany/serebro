@@ -1,6 +1,8 @@
+import os from 'node:os';
+import path from 'node:path';
 import adapter from '@sveltejs/adapter-node';
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
 	plugins: [
@@ -13,5 +15,11 @@ export default defineConfig({
 
 			adapter: adapter()
 		})
-	]
+	],
+	test: {
+		include: ['src/**/*.test.ts'],
+		// Tests get a throwaway data folder; each test file clears it as needed.
+		env: { SEREBRO_DATA_DIR: path.join(os.tmpdir(), `serebro-test-${process.pid}`) },
+		fileParallelism: false
+	}
 });

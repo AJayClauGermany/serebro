@@ -1,42 +1,42 @@
 // Read and edit the sandbox policy file for an environment.
-import { json } from '@sveltejs/kit';
-import { notFound } from '#lib/server/http.ts';
-import { compilePolicy, starterPolicy } from '#lib/server/policy.ts';
+import { Effect } from 'effect';
+import { api, requestJson } from '#lib/server/http.ts';
+import { compileFor, starterPolicy } from '#lib/server/policy.ts';
 import { resolvePolicyFile, writePolicyFile } from '#lib/server/policy-file.ts';
-import { getEnvironment } from '#lib/server/store.ts';
-import type { PolicyFileSource, PolicyFileState } from '#lib/types.ts';
+import { decodeBody, PolicyWriteBody } from '#lib/server/schemas.ts';
+import { Store } from '#lib/server/store.ts';
+import type { PolicyFileState } from '#lib/types.ts';
 
-export const GET = ({ params, url }) => {
-	const env = getEnvironment(params.id);
-	if (!env) return notFound('Environment');
-	const { report } = compilePolicy(env);
-	// Cheap poll used by the chat page to notice edits.
-	if (url.searchParams.has('hash')) return json({ hash: report.hash, blocked: report.blocked });
-	const r = resolvePolicyFile(env);
-	const state: PolicyFileState = {
-		mode: env.policyFile.mode,
-		candidates: r.candidates,
-		active: r.active
-			? { source: r.active.source, path: r.active.path, exists: r.active.exists, content: r.active.content, errors: r.active.validation.errors }
-			: null,
-		starter: starterPolicy(env),
-		hash: report.hash
-	};
-	return json(state);
-};
+export const GET = ({ params, url }) =>
+	api(
+		'api.environments.policy.get',
+		Effect.gen(function* () {
+			const env = yield* (yield* Store).getEnvironment(params.id);
+			const { report } = yield* compileFor(env);
+			// Cheap poll used by the chat page to notice edits.
+			if (url.searchParams.has('hash')) return { hash: report.hash, blocked: report.blocked };
+			const r = resolvePolicyFile(env);
+			const state: PolicyFileState = {
+				mode: env.policyFile.mode,
+				candidates: r.candidates,
+				active: r.active
+					? { source: r.active.source, path: r.active.path, exists: r.active.exists, content: r.active.content, errors: r.active.validation.errors }
+					: null,
+				starter: starterPolicy(env),
+				hash: report.hash
+			};
+			return state;
+		})
+	);
 
 /** Body: { target: 'project' | 'global' | 'custom', content: string } */
-export const PUT = async ({ params, request }) => {
-	const env = getEnvironment(params.id);
-	if (!env) return notFound('Environment');
-	const body = await request.json();
-	const target = body.target as PolicyFileSource;
-	if (!['project', 'global', 'custom'].includes(target)) return json({ error: 'Unknown target' }, { status: 400 });
-	try {
-		const v = writePolicyFile(env, target, String(body.content ?? ''));
-		if (!v.ok) return json({ error: 'The file was not saved.', errors: v.errors }, { status: 422 });
-	} catch (e) {
-		return json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });
-	}
-	return json({ ok: true, hash: compilePolicy(env).report.hash });
-};
+export const PUT = ({ params, request }) =>
+	api(
+		'api.environments.policy.put',
+		Effect.gen(function* () {
+			const env = yield* (yield* Store).getEnvironment(params.id);
+			const body = yield* requestJson(request).pipe(Effect.flatMap(decodeBody(PolicyWriteBody)));
+			yield* writePolicyFile(env, body.target, body.content);
+			return { ok: true, hash: (yield* compileFor(env)).report.hash };
+		})
+	);

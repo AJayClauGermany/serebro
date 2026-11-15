@@ -13,8 +13,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { SandboxRuntimeConfigSchema } from '@anthropic-ai/sandbox-runtime';
+import { Effect } from 'effect';
 import type { PolicyCandidate, PolicyFileSource } from '#lib/types.ts';
-import type { StoredEnvironment } from './store.ts';
+import { FileSystemError, InvalidInput, PolicyInvalid } from './errors.ts';
+import type { StoredEnvironment } from './schemas.ts';
 
 export const POLICY_FILENAME = '.srt-settings.json';
 
@@ -94,24 +96,42 @@ export function resolvePolicyFile(env: StoredEnvironment): ResolvedPolicyFile {
 			candidates
 		};
 	}
-	const content = fs.readFileSync(pick.path, 'utf8');
+	let content: string;
+	try {
+		content = fs.readFileSync(pick.path, 'utf8');
+	} catch (e) {
+		// Unreadable (permissions, a folder, …): block the sandbox rather than crash the page.
+		const reason = e instanceof Error ? e.message : String(e);
+		return {
+			active: { ...pick, content: '', hash: '', validation: { ok: false, errors: [`Cannot read ${pick.path}: ${reason}`] } },
+			candidates
+		};
+	}
 	return { active: { ...pick, content, hash: hashText(content), validation: validatePolicy(content) }, candidates };
 }
 
-export function pathFor(env: StoredEnvironment, target: PolicyFileSource) {
-	if (target === 'project') return projectPolicyPath(env);
-	if (target === 'global') return globalPolicyPath();
+export function pathFor(env: StoredEnvironment, target: PolicyFileSource): Effect.Effect<string, InvalidInput> {
+	if (target === 'project') return Effect.succeed(projectPolicyPath(env));
+	if (target === 'global') return Effect.succeed(globalPolicyPath());
 	const c = customPolicyPath(env);
-	if (!c) throw new Error('Set a custom policy file path on the environment first');
-	return c;
+	return c ? Effect.succeed(c) : Effect.fail(new InvalidInput({ message: 'Set a custom policy file path on the environment first' }));
 }
 
 /** Validate and save a policy file. Refuses to write anything that srt would reject. */
-export function writePolicyFile(env: StoredEnvironment, target: PolicyFileSource, content: string): ValidationResult {
+export const writePolicyFile = Effect.fn('writePolicyFile')(function* (
+	env: StoredEnvironment,
+	target: PolicyFileSource,
+	content: string
+) {
+	const file = yield* pathFor(env, target);
 	const v = validatePolicy(content);
-	if (!v.ok) return v;
-	const file = pathFor(env, target);
-	fs.mkdirSync(path.dirname(file), { recursive: true });
-	fs.writeFileSync(file, content.endsWith('\n') ? content : `${content}\n`);
+	if (!v.ok) return yield* new PolicyInvalid({ path: file, errors: v.errors });
+	yield* Effect.tryPromise({
+		try: async () => {
+			await fs.promises.mkdir(path.dirname(file), { recursive: true });
+			await fs.promises.writeFile(file, content.endsWith('\n') ? content : `${content}\n`);
+		},
+		catch: (cause) => new FileSystemError({ op: 'write', path: file, cause })
+	});
 	return v;
-}
+});

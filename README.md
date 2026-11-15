@@ -79,6 +79,16 @@ Browser (Svelte, createChat) ──SSE── /api/chat
 
 `srtSandbox` is a TanStack AI `SandboxProvider`. It reuses the local-process handle and wraps every command the agent runs in `srt`. Each environment gets its own generated settings file.
 
+### Errors (Effect)
+
+The server code uses [Effect](https://effect.website) v4 (stable modules only) so failures are typed and handled in one place:
+
+- **Expected failures are tagged errors** (`src/lib/server/errors.ts`): `NotFound`, `InvalidInput`, `PolicyInvalid`, `SandboxBlocked`, `FileSystemError`, `StoreCorrupt`. Each function's type lists the ones it can fail with.
+- **`src/lib/server/http.ts`** runs route effects and maps each error to a status in one exhaustive switch. Anything unexpected is logged with its full cause and the client gets a generic 500.
+- **Everything crossing a boundary is validated with `Schema`** (`src/lib/server/schemas.ts`): request bodies, and every data file when it is read. A corrupt data file fails loudly and is never overwritten.
+- **`Store`** (`src/lib/server/store.ts`) is an Effect service; its writes run one at a time so concurrent requests cannot lose updates.
+- **Environment variables** are validated at startup (`src/lib/server/config.ts`); a bad value stops the server with a clear message.
+
 ## Data
 
 Everything is stored in `./.serebro` (change it with `SEREBRO_DATA_DIR`):
@@ -113,4 +123,5 @@ To put it behind your own authenticating proxy, set `SEREBRO_ALLOWED_HOSTS=sereb
 pnpm dev      # dev server
 pnpm build    # production build (adapter-node) → node build
 pnpm check    # type-check
+pnpm test     # unit tests (vitest + @effect/vitest)
 ```

@@ -4,9 +4,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Effect } from 'effect';
 import type { AccessEntry, AccessReport } from '#lib/types.ts';
+import { DATA_DIR } from './config.ts';
+import { FileSystemError, SandboxBlocked } from './errors.ts';
 import { getHarness, which } from './harnesses';
-import { DATA_DIR, getSecrets, sandboxDir, type StoredEnvironment } from './store';
+import type { StoredEnvironment } from './schemas.ts';
+import { Store } from './store.ts';
 import { expandHome, hashText, policyCandidates, resolvePolicyFile, workspacePath } from './policy-file.ts';
 
 /** Folders that hold credentials on most machines. Pre-filled into new environments. */
@@ -76,7 +80,11 @@ function protectedPolicyFiles(env: StoredEnvironment): AccessEntry[] {
 	}));
 }
 
-export function compilePolicy(env: StoredEnvironment, secrets = getSecrets(env.id)): CompiledPolicy {
+/**
+ * Pure: the same environment and secrets always give the same settings and report.
+ * (It does look at the disk to find policy files and installed binaries.)
+ */
+export function compilePolicy(env: StoredEnvironment, secrets: Record<string, string>): CompiledPolicy {
 	const harness = getHarness(env.harness);
 	const warnings: string[] = [];
 	const tmpDir = tmpDirFor(env.id);
@@ -287,13 +295,32 @@ export function starterPolicy(env: StoredEnvironment): string {
 	return JSON.stringify(config, null, 2) + '\n';
 }
 
-/** Write the srt settings file for an environment and return its path. */
-export function writeSettings(env: StoredEnvironment, compiled = compilePolicy(env)) {
-	const dir = sandboxDir(env.id);
-	const file = path.join(dir, 'srt-settings.json');
-	fs.writeFileSync(file, JSON.stringify(compiled.settings, null, 2), { mode: 0o600 });
-	fs.mkdirSync(compiled.tmpDir, { recursive: true, mode: 0o700 });
+/** Load the environment's secrets and compile its policy. */
+export const compileFor = (env: StoredEnvironment) =>
+	Effect.gen(function* () {
+		const store = yield* Store;
+		return compilePolicy(env, yield* store.getSecrets(env.id));
+	});
+
+/**
+ * Compile the policy, refuse to continue if it is blocked, and write the srt settings
+ * file. Returns the compiled policy and the settings file path.
+ */
+export const prepareSandbox = Effect.fn('prepareSandbox')(function* (env: StoredEnvironment) {
+	const store = yield* Store;
+	const compiled = yield* compileFor(env);
+	if (compiled.report.blocked) return yield* new SandboxBlocked({ message: compiled.report.blocked });
+	const settingsFile = path.join(yield* store.sandboxDir(env.id), 'srt-settings.json');
+	yield* Effect.tryPromise({
+		try: () => fs.promises.writeFile(settingsFile, JSON.stringify(compiled.settings, null, 2), { mode: 0o600 }),
+		catch: (cause) => new FileSystemError({ op: 'write', path: settingsFile, cause })
+	});
 	// sandbox-runtime always allows writes to /tmp/claude but only binds it if it exists.
-	fs.mkdirSync('/tmp/claude', { recursive: true });
-	return file;
-}
+	for (const [dir, mode] of [[compiled.tmpDir, 0o700], ['/tmp/claude', undefined]] as const) {
+		yield* Effect.tryPromise({
+			try: () => fs.promises.mkdir(dir, { recursive: true, mode }),
+			catch: (cause) => new FileSystemError({ op: 'mkdir', path: dir, cause })
+		});
+	}
+	return { compiled, settingsFile };
+});
