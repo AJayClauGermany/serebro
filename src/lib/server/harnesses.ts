@@ -136,10 +136,6 @@ export function getHarness(id: HarnessId): HarnessDefinition {
 	return h;
 }
 
-export function isHarnessId(v: unknown): v is HarnessId {
-	return typeof v === 'string' && v in HARNESSES;
-}
-
 export function which(binary: string): string | null {
 	try {
 		const out = execFileSync(os.platform() === 'win32' ? 'where' : 'which', [binary], {

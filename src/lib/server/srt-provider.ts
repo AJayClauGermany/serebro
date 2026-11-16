@@ -17,11 +17,13 @@ import type {
 	SandboxProvider
 } from '@tanstack/ai-sandbox';
 import { localProcessSandbox } from '@tanstack/ai-sandbox-local-process';
+import { Option } from 'effect';
+import { serverConfig } from './config.ts';
 
 const require = createRequire(import.meta.url);
 
 export function srtBinary(): string {
-	if (process.env.SEREBRO_SRT_BIN) return process.env.SEREBRO_SRT_BIN;
+	if (Option.isSome(serverConfig.srtBin)) return serverConfig.srtBin.value;
 	const pkg = require.resolve('@anthropic-ai/sandbox-runtime/package.json');
 	return path.join(path.dirname(pkg), 'dist', 'cli.js');
 }

@@ -6,35 +6,37 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { chat, type StreamChunk } from '@tanstack/ai';
 import { defineSandbox, withSandbox } from '@tanstack/ai-sandbox';
-import type { ProbeResult } from '#lib/types.ts';
-import { getHarness } from './harnesses';
-import { compilePolicy, writeSettings } from './policy';
-import { projectPolicyPath } from './policy-file.ts';
-import { DATA_DIR, patchSession, type StoredEnvironment } from './store';
-import { proxyEnv, shellQuote, srtSandbox, wrapCommand } from './srt-provider';
-import type { SessionView } from '#lib/types.ts';
+import { Cause, Context, Duration, Effect, Stream } from 'effect';
+import type { ProbeResult, SessionView } from '#lib/types.ts';
+import { DATA_DIR, serverConfig } from './config.ts';
+import { getHarness } from './harnesses.ts';
+import { AgentFailed, AgentTimedOut, SandboxBlocked } from './errors.ts';
+import { prepareSandbox } from './policy.ts';
+import { projectPolicyPath, workspacePath } from './policy-file.ts';
+import type { StoredEnvironment } from './schemas.ts';
+import { Store } from './store.ts';
+import { proxyEnv, shellQuote, srtSandbox, wrapCommand } from './srt-provider.ts';
 
-function resolveWorkspace(env: StoredEnvironment) {
-	const w = env.workspace.startsWith('~/') ? path.join(os.homedir(), env.workspace.slice(2)) : env.workspace;
-	return path.resolve(w);
-}
-
-export function runAgent(opts: {
+/**
+ * Prepare the sandbox and start one agent turn. Setup problems (an invalid policy file, an
+ * unwritable data folder) fail the Effect before anything starts; the caller reports them.
+ */
+export const runAgent = Effect.fn('runAgent')(function* (opts: {
 	env: StoredEnvironment;
 	session: SessionView;
 	messages: Parameters<typeof chat>[0]['messages'];
 	signal: AbortSignal;
-}): AsyncIterable<StreamChunk> {
+}) {
 	const { env, session, messages, signal } = opts;
+	const store = yield* Store;
 	const harness = getHarness(session.harness);
-	const compiled = compilePolicy(env);
-	if (compiled.report.blocked) throw new Error(compiled.report.blocked);
-	const settingsFile = writeSettings(env, compiled);
+	const { compiled, settingsFile } = yield* prepareSandbox(env);
+	yield* Effect.annotateCurrentSpan({ environment: env.id, session: session.id, harness: harness.id });
 
 	const sandbox = defineSandbox({
 		id: `serebro-${env.id}`,
 		provider: srtSandbox({
-			workspace: resolveWorkspace(env),
+			workspace: workspacePath(env),
 			settingsFile,
 			env: compiled.env
 		}),
@@ -42,25 +44,83 @@ export function runAgent(opts: {
 		fileEvents: false
 	});
 
+	// The agent gets its own controller: stopping it on a timeout must not also abort the
+	// HTTP response, or the RUN_ERROR explaining why would never reach the browser.
+	const agentAbort = abortFrom(signal);
 	const stream = chat({
 		adapter: harness.createAdapter(session.model),
 		threadId: session.id,
 		messages,
-		abortController: abortFrom(signal),
+		abortController: agentAbort,
 		middleware: [withSandbox(sandbox)],
 		modelOptions: session.agentSessionId ? { sessionId: session.agentSessionId } : {}
 	} as never) as AsyncIterable<StreamChunk>;
 
-	// Remember the harness's own session id so the next turn resumes the agent's context.
-	return (async function* () {
-		for await (const chunk of stream) {
+	return superviseAgentStream(stream, {
+		// Run the stream with this request's services, so its logs and spans go where ours do.
+		context: yield* Effect.context(),
+		turnTimeout: serverConfig.turnTimeout,
+		idleTimeout: serverConfig.idleTimeout,
+		stop: () => agentAbort.abort(),
+		attributes: { environment: env.id, session: session.id, harness: harness.id },
+		onChunk: (chunk) => {
 			const c = chunk as { type: string; name?: string; value?: { sessionId?: string } };
-			if (c.type === 'CUSTOM' && c.name === harness.sessionEvent && c.value?.sessionId) {
-				patchSession(session.id, { agentSessionId: c.value.sessionId });
-			}
-			yield chunk;
+			if (c.type !== 'CUSTOM' || c.name !== harness.sessionEvent || !c.value?.sessionId) return Effect.void;
+			// Remember the harness's own session id so the next turn resumes the agent's context.
+			// Best effort: a failure is logged and must not cut off the agent's reply.
+			return store.patchSession(session.id, { agentSessionId: c.value.sessionId }).pipe(
+				Effect.catchCause((cause) =>
+					Effect.logWarning('Could not save the agent session id; the next turn starts fresh', Cause.pretty(cause))
+				)
+			);
 		}
-	})();
+	});
+});
+
+const runError = (message: string) => ({ type: 'RUN_ERROR', timestamp: Date.now(), message }) as unknown as StreamChunk;
+
+/**
+ * Wrap an agent's event stream with the turn limits and error handling:
+ * - no event for `idleTimeout`, or the turn running past `turnTimeout`, stops the agent;
+ * - an exception from the agent stream is logged with its cause;
+ * in both cases the browser receives one RUN_ERROR event saying what happened.
+ */
+export function superviseAgentStream(
+	source: AsyncIterable<StreamChunk>,
+	opts: {
+		turnTimeout: Duration.Duration;
+		idleTimeout: Duration.Duration;
+		/** Stop the agent process. */
+		stop: () => void;
+		onChunk?: (chunk: StreamChunk) => Effect.Effect<void>;
+		attributes?: Record<string, string>;
+		context?: Context.Context<never>;
+	}
+): AsyncIterable<StreamChunk> {
+	const timedOut = (limit: 'turn' | 'idle', after: Duration.Duration) =>
+		new AgentTimedOut({ limit, after: Duration.format(after) });
+	return Stream.fromAsyncIterable(source, (cause) => new AgentFailed({ cause })).pipe(
+		Stream.tap((chunk) => opts.onChunk?.(chunk) ?? Effect.void),
+		Stream.timeoutOrElse({
+			duration: opts.idleTimeout,
+			orElse: () => Stream.fail(timedOut('idle', opts.idleTimeout))
+		}),
+		Stream.interruptWhen(Effect.sleep(opts.turnTimeout).pipe(Effect.andThen(Effect.fail(timedOut('turn', opts.turnTimeout))))),
+		Stream.catch((e) =>
+			Stream.fromEffect(
+				Effect.sync(opts.stop).pipe(
+					Effect.andThen(
+						e._tag === 'AgentTimedOut'
+							? Effect.logWarning(e.message)
+							: Effect.logError('The agent stream failed', Cause.pretty(Cause.fail(e.cause)))
+					),
+					Effect.as(runError(e.message))
+				)
+			)
+		),
+		Stream.withSpan('agent.turn', { attributes: opts.attributes }),
+		Stream.toAsyncIterableWith(opts.context ?? Context.empty())
+	);
 }
 
 function abortFrom(signal: AbortSignal) {
@@ -70,34 +130,40 @@ function abortFrom(signal: AbortSignal) {
 	return ac;
 }
 
-function run(command: string, cwd: string, env: Record<string, string>, timeoutMs = 20_000) {
-	return new Promise<{ code: number; out: string }>((resolve) => {
+/** Run a shell command. Never fails: a non-zero exit, a timeout or a spawn error is a result. */
+const run = (command: string, cwd: string, env: Record<string, string>, timeout = Duration.seconds(20)) =>
+	Effect.callback<{ code: number; out: string }>((resume, signal) => {
 		execFile(
 			'/bin/sh',
 			['-c', command],
-			{ cwd, timeout: timeoutMs, env: { PATH: process.env.PATH ?? '', HOME: os.homedir(), ...proxyEnv(), ...env } },
+			{
+				cwd,
+				signal,
+				timeout: Duration.toMillis(timeout),
+				env: { PATH: process.env.PATH ?? '', HOME: os.homedir(), ...proxyEnv(), ...env }
+			},
 			(err, stdout, stderr) => {
 				const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
-				resolve({ code, out: `${stdout}${stderr}`.trim().slice(-2000) });
+				resume(Effect.succeed({ code, out: `${stdout}${stderr}`.trim().slice(-2000) }));
 			}
 		);
 	});
-}
+
+const failed = (name: string, output: string): ProbeResult[] => [
+	{ name, command: '', expect: 'allowed', outcome: 'blocked', pass: false, output }
+];
 
 /**
  * Run a few harmless commands inside the sandbox and check that each is allowed or
  * blocked as the policy says. This is the "does it actually work?" button.
  */
-export async function probeEnvironment(env: StoredEnvironment): Promise<ProbeResult[]> {
-	const compiled = compilePolicy(env);
-	if (compiled.report.blocked) {
-		return [{ name: 'Policy file is valid', command: '', expect: 'allowed', outcome: 'blocked', pass: false, output: compiled.report.blocked }];
-	}
-	const settingsFile = writeSettings(env, compiled);
-	const cwd = resolveWorkspace(env);
-	if (!fs.existsSync(cwd)) {
-		return [{ name: 'Workspace exists', command: '', expect: 'allowed', outcome: 'blocked', pass: false, output: `Missing: ${cwd}` }];
-	}
+export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: StoredEnvironment) {
+	const prepared = yield* prepareSandbox(env).pipe(Effect.catchTag('SandboxBlocked', Effect.succeed));
+	if (prepared instanceof SandboxBlocked) return failed('Policy file is valid', prepared.message);
+	const { compiled, settingsFile } = prepared;
+	const cwd = workspacePath(env);
+	if (!fs.existsSync(cwd)) return failed('Workspace exists', `Missing: ${cwd}`);
+
 	const marker = `.serebro-probe-${Date.now()}`;
 	const outside = path.join(os.homedir(), marker);
 	const firstDenied = compiled.report.filesystem.denyRead.find(
@@ -126,15 +192,18 @@ export async function probeEnvironment(env: StoredEnvironment): Promise<ProbeRes
 			: [])
 	];
 
-	const results: ProbeResult[] = [];
-	for (const p of probes) {
-		const r = await run(wrapCommand(settingsFile, p.command), cwd, compiled.env);
-		const outcome = r.code === 0 ? 'allowed' : 'blocked';
-		results.push({ ...p, outcome, pass: outcome === p.expect, output: redact(r.out, compiled.env) });
-	}
-	fs.rmSync(outside, { force: true });
-	return results;
-}
+	return yield* Effect.forEach(probes, (p) =>
+		run(wrapCommand(settingsFile, p.command), cwd, compiled.env).pipe(
+			Effect.map((r): ProbeResult => {
+				const outcome = r.code === 0 ? 'allowed' : 'blocked';
+				return { ...p, outcome, pass: outcome === p.expect, output: redact(r.out, compiled.env) };
+			})
+		)
+	).pipe(
+		// Remove the marker even if the probe is interrupted (the browser went away).
+		Effect.ensuring(Effect.sync(() => fs.rmSync(outside, { force: true })))
+	);
+});
 
 /** Exit 0 only if the path's content is visible (a denied folder shows up empty). */
 function canSee(p: string) {

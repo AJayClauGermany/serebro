@@ -9,14 +9,14 @@
 // To expose it deliberately (e.g. behind your own auth proxy), set
 // SEREBRO_ALLOWED_HOSTS=serebro.example.com and SEREBRO_ALLOW_REMOTE=1.
 
-import type { Handle } from '@sveltejs/kit/hooks';
+import type { Handle, HandleServerError } from '@sveltejs/kit/hooks';
+import { Effect } from 'effect';
+import { serverConfig } from '#lib/server/config.ts';
+import { runtime } from '#lib/server/runtime.ts';
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
-const extraHosts = (process.env.SEREBRO_ALLOWED_HOSTS ?? '')
-	.split(',')
-	.map((h) => h.trim().toLowerCase())
-	.filter(Boolean);
-const allowRemote = process.env.SEREBRO_ALLOW_REMOTE === '1';
+const extraHosts = serverConfig.allowedHosts;
+const allowRemote = serverConfig.allowRemote;
 
 function hostAllowed(hostWithPort: string | null) {
 	if (!hostWithPort) return false;
@@ -60,3 +60,16 @@ export const handle: Handle = async ({ event, resolve }) => {
 	}
 	return resolve(event);
 };
+
+/**
+ * Errors thrown outside the Effect routes (a bug in plain code, a framework problem).
+ * Route effects log their own failures in `http.ts`. Returns nothing, so SvelteKit
+ * keeps its default (generic) message for the client.
+ */
+export const handleError: HandleServerError = async ({ kind, error, event }) => {
+	if (kind !== 'unknown') return;
+	await runtime.runPromise(Effect.logError(`Unhandled error in ${event.request.method} ${event.url.pathname}`, error));
+};
+
+// adapter-node emits this on SIGINT/SIGTERM. Closing the runtime flushes pending telemetry.
+process.once('sveltekit:shutdown', () => void runtime.dispose());
