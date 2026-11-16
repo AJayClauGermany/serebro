@@ -1,6 +1,7 @@
 // Starts agent runs and sandbox self-tests for an environment.
 
 import { execFile } from 'node:child_process';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -9,13 +10,14 @@ import { defineSandbox, withSandbox } from '@tanstack/ai-sandbox';
 import { Cause, Context, Duration, Effect, Stream } from 'effect';
 import type { ProbeResult, SessionView } from '#lib/types.ts';
 import { DATA_DIR, serverConfig } from './config.ts';
-import { getHarness } from './harnesses.ts';
+import { getHarness, which } from './harnesses.ts';
 import { AgentFailed, AgentTimedOut, SandboxBlocked } from './errors.ts';
 import { prepareSandbox } from './policy.ts';
 import { projectPolicyPath, workspacePath } from './policy-file.ts';
 import type { StoredEnvironment } from './schemas.ts';
 import { Store } from './store.ts';
-import { proxyEnv, shellQuote, srtSandbox, wrapCommand } from './srt-provider.ts';
+import { shellQuote, wrapCommand } from './sandbox-backends.ts';
+import { localSandbox, proxyEnv } from './sandbox-provider.ts';
 
 /**
  * Prepare the sandbox and start one agent turn. Setup problems (an invalid policy file, an
@@ -30,14 +32,16 @@ export const runAgent = Effect.fn('runAgent')(function* (opts: {
 	const { env, session, messages, signal } = opts;
 	const store = yield* Store;
 	const harness = getHarness(session.harness);
-	const { compiled, settingsFile } = yield* prepareSandbox(env);
+	const { compiled, settingsFile, stateDir } = yield* prepareSandbox(env);
 	yield* Effect.annotateCurrentSpan({ environment: env.id, session: session.id, harness: harness.id });
 
 	const sandbox = defineSandbox({
 		id: `serebro-${env.id}`,
-		provider: srtSandbox({
+		provider: localSandbox({
+			backend: compiled.backend,
 			workspace: workspacePath(env),
 			settingsFile,
+			stateDir,
 			env: compiled.env
 		}),
 		lifecycle: { reuse: 'thread', destroyOnComplete: false },
@@ -159,8 +163,8 @@ const failed = (name: string, output: string): ProbeResult[] => [
  */
 export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: StoredEnvironment) {
 	const prepared = yield* prepareSandbox(env).pipe(Effect.catchTag('SandboxBlocked', Effect.succeed));
-	if (prepared instanceof SandboxBlocked) return failed('Policy file is valid', prepared.message);
-	const { compiled, settingsFile } = prepared;
+	if (prepared instanceof SandboxBlocked) return failed('Sandbox can start', prepared.message);
+	const { compiled, settingsFile, stateDir } = prepared;
 	const cwd = workspacePath(env);
 	if (!fs.existsSync(cwd)) return failed('Workspace exists', `Missing: ${cwd}`);
 
@@ -180,7 +184,10 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 		{ name: 'Writes inside the workspace', command: `touch ${marker} && rm ${marker}`, expect: 'allowed' },
 		{ name: 'Writes outside the workspace', command: `touch ${outside}`, expect: 'blocked' },
 		{ name: 'Reads the Serebro data folder', command: canSee(DATA_DIR), expect: 'blocked' },
-		{ name: 'Changes its own policy file', command: `touch ${shellQuote(projectPolicyPath(env))}`, expect: 'blocked' },
+		// Only sandbox-runtime reads policy files; with nono there is no such file to protect.
+		...(compiled.backend === 'srt'
+			? [{ name: 'Changes its own policy file', command: `touch ${shellQuote(projectPolicyPath(env))}`, expect: 'blocked' as const }]
+			: []),
 		...(firstDenied
 			? [{ name: `Reads a denied path (${firstDenied})`, command: canSee(firstDenied.replace(/^~(?=$|\/)/, os.homedir())), expect: 'blocked' as const }]
 			: []),
@@ -192,8 +199,42 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 			: [])
 	];
 
+	// A stand-in for any service on this machine's localhost (Serebro's own API is one). nono
+	// shares the machine's network unless told otherwise, so check the agent cannot reach it.
+	// (srt differs by platform here, so its behaviour is left as it was.)
+	const local = compiled.backend === 'nono' ? yield* listenOnLoopback : null;
+	// Reads are an allow-list under nono, so check the tool every coding agent leans on can
+	// read its settings and commit. A scratch repository in the private temp folder; signing
+	// is off because a signing helper is the user's own program and may live anywhere.
+	if (compiled.backend === 'nono' && which('git'))
+		probes.push({
+			name: 'Commits with git',
+			command:
+				'd=$(mktemp -d) && cd "$d" && git init -q && git -c user.name=probe -c user.email=probe@localhost -c commit.gpgsign=false commit -q --allow-empty -m probe; s=$?; cd / && rm -rf "$d"; exit $s',
+			expect: 'allowed'
+		});
+
+	// The same for Unix sockets, which are not part of the network rules: Docker, ssh-agent and
+	// the session bus all listen on one.
+	const sockDir = compiled.backend === 'nono' && os.platform() === 'linux' ? fs.mkdtempSync(path.join(os.tmpdir(), 'serebro-probe-')) : null;
+	const unix = sockDir ? yield* listenOnSocket(path.join(sockDir, 'probe.sock')) : null;
+	if (sockDir)
+		probes.push({
+			name: 'Connects to a Unix socket on this machine',
+			command: `curl -sS -m 5 --unix-socket ${shellQuote(path.join(sockDir, 'probe.sock'))} -o /dev/null http://localhost/`,
+			expect: 'blocked'
+		});
+	if (local) {
+		const port = (local.address() as net.AddressInfo).port;
+		probes.push({
+			name: "Reaches a service on this machine's localhost",
+			command: `curl -sS -m 5 --noproxy '*' -o /dev/null http://127.0.0.1:${port}/`,
+			expect: 'blocked'
+		});
+	}
+
 	return yield* Effect.forEach(probes, (p) =>
-		run(wrapCommand(settingsFile, p.command), cwd, compiled.env).pipe(
+		run(wrapCommand({ backend: compiled.backend, settingsFile, stateDir }, p.command), cwd, compiled.env).pipe(
 			Effect.map((r): ProbeResult => {
 				const outcome = r.code === 0 ? 'allowed' : 'blocked';
 				return { ...p, outcome, pass: outcome === p.expect, output: redact(r.out, compiled.env) };
@@ -201,9 +242,32 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 		)
 	).pipe(
 		// Remove the marker even if the probe is interrupted (the browser went away).
-		Effect.ensuring(Effect.sync(() => fs.rmSync(outside, { force: true })))
+		Effect.ensuring(
+			Effect.sync(() => {
+				fs.rmSync(outside, { force: true });
+				local?.close();
+				unix?.close();
+				if (sockDir) fs.rmSync(sockDir, { recursive: true, force: true });
+			})
+		)
 	);
 });
+
+const probeServer = () =>
+	net.createServer((socket) => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'));
+
+/** A throwaway HTTP-ish listener on 127.0.0.1, on a port the system picks. */
+const listenOnLoopback = Effect.callback<net.Server>((resume) => {
+	const server = probeServer();
+	server.listen(0, '127.0.0.1', () => resume(Effect.succeed(server)));
+});
+
+/** The same, on a Unix socket. */
+const listenOnSocket = (file: string) =>
+	Effect.callback<net.Server>((resume) => {
+		const server = probeServer();
+		server.listen(file, () => resume(Effect.succeed(server)));
+	});
 
 /** Exit 0 only if the path's content is visible (a denied folder shows up empty). */
 function canSee(p: string) {

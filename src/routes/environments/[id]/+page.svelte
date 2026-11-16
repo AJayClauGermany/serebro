@@ -59,7 +59,7 @@
 						{data.harness.label} · <code>{env.model}</code>
 						<span class="tag {data.harness.installed ? 'ok' : 'bad'}">{data.harness.installed ? 'installed' : 'not installed'}</span>
 					</dd>
-					<dt>Sandbox</dt><dd>Anthropic sandbox-runtime (srt)</dd>
+					<dt>Sandbox</dt><dd>{data.access.sandbox.label} <span class="small muted">({data.access.sandbox.reason})</span></dd>
 				</dl>
 				<div class="row">
 					<button class="primary" onclick={newChat}>▶ New chat</button>
@@ -96,7 +96,8 @@
 				{/if}
 			</section>
 
-			{#key env.id}<PolicyEditor envId={env.id} />{/key}
+			<!-- Policy files are sandbox-runtime files; nono environments have none. -->
+			{#if data.access.sandbox.id === 'srt'}{#key env.id}<PolicyEditor envId={env.id} />{/key}{/if}
 
 			<section class="box">
 				<h2 class="pad">Chats</h2>

@@ -4,7 +4,7 @@ A web control panel for running coding agents inside a sandbox you control.
 
 You create an **environment**: the project folder the agent works in, the agent to run, and exactly which files, websites and keys it can use. Serebro shows you what the agent can and cannot touch, lets you test the sandbox with one click, then gives you a chat with the agent.
 
-- **Sandbox:** [Anthropic sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) (`srt`): bubblewrap on Linux, Seatbelt on macOS, plus a filtering network proxy.
+- **Sandbox:** [Anthropic sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) (`srt`): bubblewrap on Linux, Seatbelt on macOS, plus a filtering network proxy. Where srt cannot run, [nono](https://github.com/nolabs-ai/nono) (Landlock on Linux, Seatbelt on macOS) can be used instead. See [Choosing a sandbox](#choosing-a-sandbox).
 - **Agents:** Claude Code, Codex, Grok Build, OpenCode and Pi, through the [TanStack AI](https://tanstack.com/ai) harness adapters.
 - **UI:** SvelteKit + `@tanstack/ai-svelte`.
 
@@ -25,7 +25,7 @@ Open http://localhost:5173, click **New environment**, fill it in, then **Run ch
 | Sandbox tools | `bubblewrap`, `socat`, `ripgrep` (`sudo apt-get install bubblewrap socat ripgrep`) | `ripgrep` (`brew install ripgrep`) |
 | The agent's CLI | see below | see below |
 
-The home page lists anything missing.
+The home page lists anything missing. If the sandbox tools cannot be installed or do not work (for example in a container without user namespaces), install [nono](https://nono.sh/docs/cli/getting_started/installation) instead: Serebro then needs none of them.
 
 | Agent | Install | Key it needs | Model API domain |
 |---|---|---|---|
@@ -44,7 +44,40 @@ The home page lists anything missing.
 | **Network** | Blocked except the agent's model API | Add domains, package registries, local ports, block lists |
 | **Credentials** | The agent gets **no** environment variables from your machine | Add keys as **direct** (agent can read them) or **masked** (agent sees a placeholder, and the real value is only sent to the hosts you list) |
 
-The access panel and the enforced sandbox settings are built by one function (`src/lib/server/policy.ts`), so what you see is what runs. Expand **Raw sandbox-runtime settings** to see the exact config.
+The access panel and the enforced sandbox settings are built by one function (`src/lib/server/policy.ts`), so what you see is what runs. Expand **Raw sandbox-runtime settings** (or **Raw nono profile**) to see the exact config.
+
+## Choosing a sandbox
+
+Each environment has a **Sandbox** setting:
+
+| Setting | What runs |
+|---|---|
+| **Automatic** (default) | sandbox-runtime when its tools are installed and bubblewrap can actually start a full sandbox (including a fresh `/proc`, which unprivileged containers refuse), otherwise nono |
+| **sandbox-runtime (srt)** | Always srt. If it cannot run, the environment does not start. |
+| **nono** | Always nono. If it is not installed, the environment does not start. |
+
+Serebro never swaps a sandbox you picked by name, and it never drops a rule a sandbox cannot enforce: the environment is blocked and the access panel says why.
+
+nono is found on `PATH`, or set `SEREBRO_NONO_BIN` to its location. It differs from srt in these ways:
+
+| | sandbox-runtime | nono |
+|---|---|---|
+| **Reading files** | Everything except the hidden paths | Only system folders, the workspace, and the paths you grant. Your home folder is hidden by default. |
+| **Hiding a path inside a folder the agent may use** (for example `.env` in the workspace) | Yes | macOS only. On Linux the environment is blocked. |
+| **Making a path read-only inside a writable folder** | Yes | No. The environment is blocked. |
+| **Masked credentials** | Yes (experimental) | Not supported yet. The environment is blocked. |
+| **Policy files** | Yes | No. **Policy file** must be Off. |
+| **Local ports** | Yes | Linux only, and only where user namespaces are available: the agent gets a loopback of its own (IPv4) and cannot reach services on this machine's localhost. On macOS the environment is blocked. |
+| **Unix sockets on this machine** (Docker, ssh-agent, the session bus) | Blocked | Blocked on Linux for sockets with a file path. Abstract sockets are only blocked on Linux 6.12 or newer. |
+| **Shared memory (`/dev/shm`)** | A private one per sandbox | Not available: POSIX semaphores and shared memory fail (for example Python `multiprocessing` locks and pools, pytest-xdist). Opening the machine's own would let the agent share memory with other programs. |
+| **Other running programs** | Hidden | Visible: names and command lines, and their environment variables when Serebro runs as root |
+| **Permission changes (`chmod`) on files outside the workspace** | Blocked | Not blocked for files you own. Content, deletes and renames are blocked. |
+| **Writable folders that do not exist yet** | The agent can create them | The agent cannot. Serebro creates the agent's own folders and warns about the rest. |
+| **Needs** | bubblewrap, socat, ripgrep on Linux | One binary; Linux 5.13 or newer with Landlock |
+
+With nono the access panel also lists what the agent can read: its own program files, the Node.js install, and the machine's CA bundle when a proxy is in use.
+
+Before an environment is shown as ready, Serebro asks nono to start an empty sandbox with the generated profile, so anything nono itself refuses (for example local ports on a machine without user namespaces) appears in the access panel and not in the middle of a chat. nono's per-command session records are kept in the environment's folder under the Serebro data folder, and pruned after a day.
 
 ## Using your own policy file
 
@@ -71,13 +104,14 @@ When a file is in use:
 Browser (Svelte, createChat) ──SSE── /api/chat
                                         │ chat({ adapter: claudeCodeText(...), middleware: [withSandbox(...)] })
                                         ▼
-                              srtSandbox provider  (src/lib/server/srt-provider.ts)
+                              localSandbox provider  (src/lib/server/sandbox-provider.ts)
                                         │ every command → srt --settings <env>.json -c '<command>'
+                                        │            or → nono run --profile <env>.json -- sh -c '<command>'
                                         ▼
-                              agent CLI inside bubblewrap/Seatbelt + filtering proxy
+                              agent CLI inside bubblewrap/Landlock/Seatbelt + filtering proxy
 ```
 
-`srtSandbox` is a TanStack AI `SandboxProvider`. It reuses the local-process handle and wraps every command the agent runs in `srt`. Each environment gets its own generated settings file.
+`localSandbox` is a TanStack AI `SandboxProvider`. It reuses the local-process handle and wraps every command the agent runs in the environment's sandbox (`wrapCommand` in `src/lib/server/sandbox-backends.ts`). Each environment gets its own generated settings file: srt settings, or a nono profile built by `src/lib/server/nono-policy.ts`.
 
 ### Errors (Effect)
 

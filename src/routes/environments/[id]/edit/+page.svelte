@@ -7,6 +7,6 @@
 
 <main class="page">
 	{#key data.environment.id}
-		<EnvironmentForm harnesses={data.harnesses} defaults={data.defaults} existing={data.environment} />
+		<EnvironmentForm harnesses={data.harnesses} sandboxes={data.sandboxes} defaults={data.defaults} existing={data.environment} />
 	{/key}
 </main>

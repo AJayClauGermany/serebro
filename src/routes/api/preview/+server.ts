@@ -1,7 +1,7 @@
 // Compile an unsaved environment form into its access report, for the live preview.
 import { Effect } from 'effect';
 import { api, requestJson } from '#lib/server/http.ts';
-import { compilePolicy } from '#lib/server/policy.ts';
+import { compileChecked } from '#lib/server/policy.ts';
 import { decodeEnvironmentInput, type StoredEnvironment } from '#lib/server/schemas.ts';
 import { Store } from '#lib/server/store.ts';
 
@@ -26,6 +26,6 @@ export const POST = ({ request }) =>
 				createdAt: '',
 				updatedAt: ''
 			};
-			return compilePolicy(env, secrets).report;
+			return (yield* compileChecked(env, secrets)).report;
 		})
 	);

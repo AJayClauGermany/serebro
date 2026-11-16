@@ -13,6 +13,7 @@ const input: EnvironmentInput = {
 	model: 'claude-sonnet-4-5',
 	filesystem: { readWrite: [], denyRead: [], allowRead: [], denyWrite: [] },
 	network: { allowedDomains: [], deniedDomains: [], packageManagers: false, harnessDefaults: true, allowLocalBinding: false },
+	sandbox: 'auto',
 	policyFile: { mode: 'off', path: '', addAgentNeeds: true },
 	credentials: [{ name: 'ANTHROPIC_API_KEY', mode: 'direct', injectHosts: [], value: 'sk-secret-value' }]
 };

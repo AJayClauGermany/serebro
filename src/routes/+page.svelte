@@ -27,6 +27,12 @@
 			{#each data.system.checks.filter((c) => !c.ok) as c}
 				<div><strong>{c.name}</strong>: {c.detail}. Fix: <code>{c.fix}</code></div>
 			{/each}
+			{#each data.system.sandboxes.filter((b) => !b.preferred && !b.available) as b}
+				<div class="small muted">
+					Or install {b.label} instead:
+					{#each b.checks.filter((c) => !c.ok) as c}<code>{c.fix}</code>{/each}
+				</div>
+			{/each}
 		</section>
 	{/if}
 
@@ -99,6 +105,13 @@
 				<h3>System</h3>
 				{#each data.system.checks as c}
 					<div class="row"><span class="tag {c.ok ? 'ok' : 'bad'}">{c.ok ? 'ok' : 'missing'}</span> {c.name}</div>
+				{/each}
+				{#each data.system.sandboxes as b}
+					<div class="row">
+						<span class="tag {b.available ? 'ok' : 'bad'}">{b.available ? 'ok' : 'missing'}</span>
+						Sandbox: {b.label}{b.preferred ? ' (used by Automatic)' : ''}
+					</div>
+					{#if b.limited}<div class="muted">{b.limited}</div>{/if}
 				{/each}
 				<div class="muted">Data folder: <code>{data.system.dataDir}</code></div>
 			</div>

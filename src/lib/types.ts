@@ -60,6 +60,16 @@ export interface NetworkConfig {
 	allowLocalBinding: boolean;
 }
 
+/** A sandbox that can enforce an environment's rules. */
+export type SandboxBackendId =
+	/** Anthropic sandbox-runtime: bubblewrap (Linux) or Seatbelt (macOS) plus a filtering proxy. */
+	| 'srt'
+	/** nono: Landlock (Linux) or Seatbelt (macOS) plus a filtering proxy. One binary, no bubblewrap. */
+	| 'nono';
+
+/** Which sandbox an environment asks for. `auto` prefers srt and uses nono when srt cannot run. */
+export type SandboxChoice = 'auto' | SandboxBackendId;
+
 /** Where the sandbox policy comes from. */
 export type PolicyFileMode =
 	/** Use <workspace>/.srt-settings.json, else ~/.srt-settings.json, else the form. */
@@ -92,6 +102,7 @@ export interface EnvironmentView {
 	workspace: string;
 	harness: HarnessId;
 	model: string;
+	sandbox: SandboxChoice;
 	filesystem: FilesystemConfig;
 	network: NetworkConfig;
 	policyFile: PolicyFileConfig;
@@ -105,6 +116,7 @@ export interface EnvironmentInput {
 	workspace: string;
 	harness: HarnessId;
 	model: string;
+	sandbox: SandboxChoice;
 	filesystem: FilesystemConfig;
 	network: NetworkConfig;
 	policyFile: PolicyFileConfig;
@@ -122,8 +134,17 @@ export interface AccessEntry {
 
 /** The effective, compiled view of what an agent in this environment can and cannot touch. */
 export interface AccessReport {
+	/** The sandbox that enforces these rules. */
+	sandbox: {
+		id: SandboxBackendId;
+		label: string;
+		/** Why this one (the environment asked for it, or auto picked it). */
+		reason: string;
+	};
 	filesystem: {
 		readWrite: AccessEntry[];
+		/** Extra read-only grants. Only used by sandboxes where reads are an allow-list (nono). */
+		readOnly: AccessEntry[];
 		readOnlyNote: string;
 		denyRead: AccessEntry[];
 		allowRead: AccessEntry[];
@@ -148,12 +169,12 @@ export interface AccessReport {
 		/** Top-level settings from the file that are passed through unchanged. */
 		otherKeys: string[];
 	};
-	/** Hash of the effective srt settings. Changes whenever the sandbox would change. */
+	/** Hash of the effective sandbox settings. Changes whenever the sandbox would change. */
 	hash: string;
-	/** Set when the sandbox must not start (for example an invalid policy file). */
+	/** Set when the sandbox must not start (an invalid policy file, a rule the sandbox cannot enforce). */
 	blocked: string | null;
-	/** Raw sandbox-runtime settings (secrets are never included). */
-	srtSettings: unknown;
+	/** Raw settings handed to the sandbox: srt settings or a nono profile (secrets are never included). */
+	rawSettings: unknown;
 	warnings: string[];
 }
 
@@ -163,7 +184,7 @@ export interface PolicyFileState {
 	active: (PolicyCandidate & { content: string; errors: string[] }) | null;
 	/** A starting point built from the environment form, for creating a new file. */
 	starter: string;
-	/** Hash of the effective srt settings (same as AccessReport.hash). */
+	/** Hash of the effective sandbox settings (same as AccessReport.hash). */
 	hash: string;
 }
 
@@ -189,10 +210,28 @@ export interface SystemCheck {
 	fix?: string;
 }
 
+export interface SandboxBackendInfo {
+	id: SandboxBackendId;
+	label: string;
+	/** True when everything this sandbox needs is installed. */
+	available: boolean;
+	/** True for the one `auto` picks on this machine. */
+	preferred: boolean;
+	/**
+	 * Set when the sandbox starts only in a reduced form on this machine. It can still be
+	 * chosen by name, but `auto` prefers another sandbox when one is available.
+	 */
+	limited?: string;
+	checks: SystemCheck[];
+}
+
 export interface SystemStatus {
 	platform: string;
+	/** True when at least one sandbox can run. */
 	ready: boolean;
+	/** Checks to show: those of the sandbox `auto` picks, plus general ones. */
 	checks: SystemCheck[];
+	sandboxes: SandboxBackendInfo[];
 	harnesses: HarnessInfo[];
 	dataDir: string;
 }
