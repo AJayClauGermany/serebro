@@ -117,6 +117,8 @@ export function canonicalPath(p: string): string {
 	}
 }
 
+const SYSTEM_GIT_CONFIG = ['/etc/gitconfig', '/opt/homebrew/etc/gitconfig', '/usr/local/etc/gitconfig'];
+
 const isDir = (p: string) => fs.statSync(p, { throwIfNoEntry: false })?.isDirectory() ?? false;
 
 /**
@@ -145,6 +147,9 @@ function nonoReadNeeds(harness: HarnessDefinition): AccessEntry[] {
 		if (path.basename(dir) === 'bin' || dir === os.homedir() || path.dirname(dir) === dir) add(real, `${harness.label} program`);
 		else add(dir, `${harness.label} program files`);
 	}
+	// The machine-wide git settings. Without them git warns on every command and refuses to commit.
+	// (nono's git_config group covers the user's own files.)
+	for (const f of SYSTEM_GIT_CONFIG) if (fs.existsSync(f)) add(f, 'System git settings');
 	for (const k of ['SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_DIR']) {
 		const v = process.env[k];
 		if (v) add(v, `CA certificates from ${k}`);
@@ -173,6 +178,7 @@ export function compilePolicy(
 	const fromFile = !!file;
 	const blocks: string[] = [];
 	if (backend.unavailable) blocks.push(backend.unavailable);
+	if (backend.limited) warnings.push(backend.limited);
 	if (file && !file.validation.ok) {
 		blocks.push(`Policy file ${file.path} is invalid, so the sandbox will not start:\n${file.validation.errors.join('\n')}`);
 	}

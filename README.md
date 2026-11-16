@@ -52,7 +52,7 @@ Each environment has a **Sandbox** setting:
 
 | Setting | What runs |
 |---|---|
-| **Automatic** (default) | sandbox-runtime when its tools are installed and bubblewrap can actually start a sandbox, otherwise nono |
+| **Automatic** (default) | sandbox-runtime when its tools are installed and bubblewrap can actually start a full sandbox (including a fresh `/proc`, which unprivileged containers refuse), otherwise nono |
 | **sandbox-runtime (srt)** | Always srt. If it cannot run, the environment does not start. |
 | **nono** | Always nono. If it is not installed, the environment does not start. |
 
@@ -69,6 +69,7 @@ nono is found on `PATH`, or set `SEREBRO_NONO_BIN` to its location. It differs f
 | **Policy files** | Yes | No. **Policy file** must be Off. |
 | **Local ports** | Yes | Linux only, and only where user namespaces are available: the agent gets a loopback of its own (IPv4) and cannot reach services on this machine's localhost. On macOS the environment is blocked. |
 | **Unix sockets on this machine** (Docker, ssh-agent, the session bus) | Blocked | Blocked on Linux for sockets with a file path. Abstract sockets are only blocked on Linux 6.12 or newer. |
+| **Shared memory (`/dev/shm`)** | A private one per sandbox | Not available: POSIX semaphores and shared memory fail (for example Python `multiprocessing` locks and pools, pytest-xdist). Opening the machine's own would let the agent share memory with other programs. |
 | **Other running programs** | Hidden | Visible: names and command lines, and their environment variables when Serebro runs as root |
 | **Permission changes (`chmod`) on files outside the workspace** | Blocked | Not blocked for files you own. Content, deletes and renames are blocked. |
 | **Writable folders that do not exist yet** | The agent can create them | The agent cannot. Serebro creates the agent's own folders and warns about the rest. |

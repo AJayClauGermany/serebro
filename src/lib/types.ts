@@ -217,6 +217,11 @@ export interface SandboxBackendInfo {
 	available: boolean;
 	/** True for the one `auto` picks on this machine. */
 	preferred: boolean;
+	/**
+	 * Set when the sandbox starts only in a reduced form on this machine. It can still be
+	 * chosen by name, but `auto` prefers another sandbox when one is available.
+	 */
+	limited?: string;
 	checks: SystemCheck[];
 }
 

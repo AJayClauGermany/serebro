@@ -58,7 +58,7 @@ function srtChecks(platform: NodeJS.Platform): SystemCheck[] {
 		// is on PATH and fails on every command.
 		const bwrap = tools[0];
 		if (bwrap.ok) {
-			const refusal = bwrapRefusal(bwrap.detail);
+			const refusal = bwrapRefusal(bwrap.detail, false);
 			tools.push({
 				name: 'bubblewrap can start a sandbox',
 				ok: refusal === null,
@@ -77,23 +77,32 @@ function srtChecks(platform: NodeJS.Platform): SystemCheck[] {
 const bwrapProbes = new Map<string, { at: number; refusal: string | null }>();
 
 /**
- * Start the emptiest sandbox sandbox-runtime could ask for (its own network and process
- * namespaces) and return bubblewrap's complaint, or null when it works. Asked once a minute.
+ * Start an empty bubblewrap sandbox and return its complaint, or null when it works. Asked
+ * once a minute. Without `withProc` this is the least sandbox-runtime ever asks for (its own
+ * network and process namespaces). With it, a fresh /proc is mounted too, which srt does
+ * unless a policy file sets `enableWeakerNestedSandbox`, and which unprivileged containers refuse.
  */
-function bwrapRefusal(bwrap: string): string | null {
-	const cached = bwrapProbes.get(bwrap);
+function bwrapRefusal(bwrap: string, withProc: boolean): string | null {
+	const key = `${bwrap}\n${withProc}`;
+	const cached = bwrapProbes.get(key);
 	if (cached && Date.now() - cached.at < 60_000) return cached.refusal;
-	const r = spawnSync(bwrap, ['--unshare-net', '--unshare-pid', '--dev-bind', '/', '/', 'true'], {
-		timeout: 3000,
-		stdio: ['ignore', 'ignore', 'pipe'],
-		encoding: 'utf8'
-	});
+	const args = ['--unshare-net', '--unshare-pid', '--dev-bind', '/', '/', ...(withProc ? ['--proc', '/proc'] : []), 'true'];
+	const r = spawnSync(bwrap, args, { timeout: 3000, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8' });
 	const refusal =
 		r.error === undefined && r.status === 0
 			? null
 			: (r.stderr ?? '').split('\n').map((l) => l.trim()).find(Boolean)?.slice(0, 200) || r.error?.message || `exit ${r.status}`;
-	bwrapProbes.set(bwrap, { at: Date.now(), refusal });
+	bwrapProbes.set(key, { at: Date.now(), refusal });
 	return refusal;
+}
+
+/** Why sandbox-runtime only works in a reduced form here, if it does. */
+function srtLimit(platform: NodeJS.Platform, checks: SystemCheck[]): string | undefined {
+	if (platform !== 'linux' || !checks.every((c) => c.ok)) return undefined;
+	const refusal = bwrapRefusal(checks[0].detail, true);
+	return refusal === null
+		? undefined
+		: `bubblewrap cannot mount /proc on this machine (${refusal}). sandbox-runtime only works here with a policy file that sets enableWeakerNestedSandbox.`;
 }
 
 function nonoChecks(platform: NodeJS.Platform): SystemCheck[] {
@@ -117,16 +126,33 @@ let cache: { at: number; value: SandboxBackendInfo[] } | null = null;
 export function sandboxBackends(): SandboxBackendInfo[] {
 	if (cache && Date.now() - cache.at < 5000) return cache.value;
 	const platform = os.platform();
-	const list = (
+	const srt = srtChecks(platform);
+	const list: SandboxBackendInfo[] = (
 		[
-			['srt', srtChecks(platform)],
-			['nono', nonoChecks(platform)]
+			['srt', srt, srtLimit(platform, srt)],
+			['nono', nonoChecks(platform), undefined]
 		] as const
-	).map(([id, checks]) => ({ id, label: BACKEND_LABEL[id], available: checks.every((c) => c.ok), preferred: false, checks }));
-	// srt first; nono only when srt cannot run. With neither, srt's missing tools are what we show.
-	(list.find((b) => b.available) ?? list[0]).preferred = true;
+	).map(([id, checks, limited]) => ({
+		id,
+		label: BACKEND_LABEL[id],
+		available: checks.every((c) => c.ok),
+		preferred: false,
+		...(limited ? { limited } : {}),
+		checks: [...checks]
+	}));
+	preferBackend(list);
 	cache = { at: Date.now(), value: list };
 	return list;
+}
+
+/**
+ * Mark the sandbox `auto` uses: srt first; nono when srt cannot run, or runs only in a
+ * reduced form. With neither, srt's missing tools are what we show.
+ */
+export function preferBackend(list: SandboxBackendInfo[]) {
+	for (const b of list) b.preferred = false;
+	const usable = list.filter((b) => b.available);
+	(usable.find((b) => !b.limited) ?? usable[0] ?? list[0]).preferred = true;
 }
 
 export interface ResolvedBackend {
@@ -135,6 +161,8 @@ export interface ResolvedBackend {
 	reason: string;
 	/** Set when the sandbox cannot run on this machine. */
 	unavailable: string | null;
+	/** Set when the sandbox runs only in a reduced form here. Shown as a warning. */
+	limited?: string;
 }
 
 /** Pure: pick the sandbox for a choice, given what is installed. */
@@ -146,11 +174,14 @@ export function pickBackend(choice: SandboxChoice, backends: SandboxBackendInfo[
 			? 'chosen for this environment'
 			: picked.id === 'srt'
 				? 'automatic: sandbox-runtime is preferred'
-				: 'automatic: sandbox-runtime cannot run on this machine';
+				: backends.find((b) => b.id === 'srt')?.limited
+					? 'automatic: sandbox-runtime cannot fully run on this machine'
+					: 'automatic: sandbox-runtime cannot run on this machine';
 	return {
 		id: picked.id,
 		label: picked.label,
 		reason,
+		...(picked.limited ? { limited: picked.limited } : {}),
 		unavailable: picked.available ? null : `${picked.label} cannot run on this machine, so the sandbox will not start:\n${missing.join('\n')}`
 	};
 }
@@ -195,9 +226,11 @@ const preflights = new Map<string, Preflight>();
 const PREFLIGHT_OK_MS = 5 * 60 * 1000;
 const PREFLIGHT_REFUSED_MS = 15 * 1000;
 
-async function runPreflight(bin: string, text: string): Promise<string | null> {
-	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'serebro-nono-'));
+/** Exported for tests. */
+export async function runPreflight(bin: string, text: string): Promise<string | null> {
+	let dir: string | undefined;
 	try {
+		dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'serebro-nono-'));
 		const file = path.join(dir, 'profile.json');
 		await fs.promises.writeFile(file, text, { mode: 0o600 });
 		const command = `${nonoLauncher(bin, file, path.join(dir, 'state'))} /bin/sh -c true`;
@@ -212,8 +245,12 @@ async function runPreflight(bin: string, text: string): Promise<string | null> {
 				}
 			);
 		});
+	} catch (e) {
+		// A problem of the check itself (no temp folder, no shell) is a refusal like any other:
+		// it blocks this environment, expires quickly, and never takes a page down.
+		return `nono could not be checked: ${e instanceof Error ? e.message : String(e)}`;
 	} finally {
-		await fs.promises.rm(dir, { recursive: true, force: true });
+		if (dir) await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => undefined);
 	}
 }
 

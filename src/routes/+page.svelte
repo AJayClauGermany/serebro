@@ -111,6 +111,7 @@
 						<span class="tag {b.available ? 'ok' : 'bad'}">{b.available ? 'ok' : 'missing'}</span>
 						Sandbox: {b.label}{b.preferred ? ' (used by Automatic)' : ''}
 					</div>
+					{#if b.limited}<div class="muted">{b.limited}</div>{/if}
 				{/each}
 				<div class="muted">Data folder: <code>{data.system.dataDir}</code></div>
 			</div>

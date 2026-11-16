@@ -10,7 +10,7 @@ import { defineSandbox, withSandbox } from '@tanstack/ai-sandbox';
 import { Cause, Context, Duration, Effect, Stream } from 'effect';
 import type { ProbeResult, SessionView } from '#lib/types.ts';
 import { DATA_DIR, serverConfig } from './config.ts';
-import { getHarness } from './harnesses.ts';
+import { getHarness, which } from './harnesses.ts';
 import { AgentFailed, AgentTimedOut, SandboxBlocked } from './errors.ts';
 import { prepareSandbox } from './policy.ts';
 import { projectPolicyPath, workspacePath } from './policy-file.ts';
@@ -203,6 +203,17 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 	// shares the machine's network unless told otherwise, so check the agent cannot reach it.
 	// (srt differs by platform here, so its behaviour is left as it was.)
 	const local = compiled.backend === 'nono' ? yield* listenOnLoopback : null;
+	// Reads are an allow-list under nono, so check the tool every coding agent leans on can
+	// read its settings and commit. A scratch repository in the private temp folder; signing
+	// is off because a signing helper is the user's own program and may live anywhere.
+	if (compiled.backend === 'nono' && which('git'))
+		probes.push({
+			name: 'Commits with git',
+			command:
+				'd=$(mktemp -d) && cd "$d" && git init -q && git -c user.name=probe -c user.email=probe@localhost -c commit.gpgsign=false commit -q --allow-empty -m probe; s=$?; cd / && rm -rf "$d"; exit $s',
+			expect: 'allowed'
+		});
+
 	// The same for Unix sockets, which are not part of the network rules: Docker, ssh-agent and
 	// the session bus all listen on one.
 	const sockDir = compiled.backend === 'nono' && os.platform() === 'linux' ? fs.mkdtempSync(path.join(os.tmpdir(), 'serebro-probe-')) : null;
