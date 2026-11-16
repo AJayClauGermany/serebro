@@ -6,7 +6,9 @@
 		CredentialMode,
 		EnvironmentView,
 		HarnessId,
-		HarnessInfo
+		HarnessInfo,
+		SandboxBackendInfo,
+		SandboxChoice
 	} from '#lib/types.ts';
 	import AccessPanel from './AccessPanel.svelte';
 	import ListEditor from './ListEditor.svelte';
@@ -14,10 +16,12 @@
 
 	let {
 		harnesses,
+		sandboxes,
 		existing = null,
 		defaults
 	}: {
 		harnesses: HarnessInfo[];
+		sandboxes: SandboxBackendInfo[];
 		existing?: EnvironmentView | null;
 		defaults: { denyRead: string[]; packageDomains: string[] };
 	} = $props();
@@ -42,12 +46,19 @@
 	let readWrite = $state<string[]>(init?.filesystem.readWrite ?? []);
 	let denyRead = $state<string[]>(init?.filesystem.denyRead ?? [...seedDefaults.denyRead]);
 	let allowRead = $state<string[]>(init?.filesystem.allowRead ?? []);
-	let denyWrite = $state<string[]>(init?.filesystem.denyWrite ?? ['.env', '.env.local']);
+	// nono cannot protect a file inside the writable workspace, so a new environment that would
+	// run on it does not start with rules that block it. (Adding one still blocks, by design.)
+	const seedNono = untrack(() => sandboxes.find((b) => b.preferred)?.id === 'nono');
+	let denyWrite = $state<string[]>(init?.filesystem.denyWrite ?? (seedNono ? [] : ['.env', '.env.local']));
 	let allowedDomains = $state<string[]>(init?.network.allowedDomains ?? []);
 	let deniedDomains = $state<string[]>(init?.network.deniedDomains ?? []);
 	let packageManagers = $state(init?.network.packageManagers ?? false);
 	let harnessDefaults = $state(init?.network.harnessDefaults ?? true);
 	let allowLocalBinding = $state(init?.network.allowLocalBinding ?? false);
+	let sandbox = $state<SandboxChoice>(init?.sandbox ?? 'auto');
+	// The sandbox that will actually run: the chosen one, or the one "auto" picks on this machine.
+	const backend = $derived(sandboxes.find((b) => (sandbox === 'auto' ? b.preferred : b.id === sandbox)) ?? sandboxes[0]);
+	const usesNono = $derived(backend.id === 'nono');
 	let policyMode = $state(init?.policyFile.mode ?? 'auto');
 	let policyPath = $state(init?.policyFile.path ?? '');
 	let addAgentNeeds = $state(init?.policyFile.addAgentNeeds ?? true);
@@ -87,9 +98,11 @@
 			workspace,
 			harness,
 			model,
+			sandbox,
 			filesystem: { readWrite, denyRead, allowRead, denyWrite },
 			network: { allowedDomains, deniedDomains, packageManagers, harnessDefaults, allowLocalBinding },
-			policyFile: { mode: policyMode, path: policyPath, addAgentNeeds },
+			// Policy files are sandbox-runtime files. nono refuses to run unless they are off.
+			policyFile: { mode: usesNono ? 'off' : policyMode, path: policyPath, addAgentNeeds },
 			credentials: credentials.map((c) => ({
 				name: c.name,
 				mode: c.mode,
@@ -209,6 +222,36 @@
 			</datalist>
 		</label>
 
+		<label class="field">
+			Sandbox
+			<span class="hint">
+				What enforces the rules below. Automatic prefers sandbox-runtime and uses nono when sandbox-runtime cannot run on
+				this machine.
+			</span>
+			<select bind:value={sandbox}>
+				<option value="auto">Automatic (now: {sandboxes.find((b) => b.preferred)?.label})</option>
+				{#each sandboxes as b (b.id)}
+					<option value={b.id}>{b.label}{b.available ? '' : ' · not installed'}</option>
+				{/each}
+			</select>
+		</label>
+		{#if !backend.available}
+			<div class="notice small">
+				{backend.label} cannot run on this machine yet:
+				{#each backend.checks.filter((c) => !c.ok) as c}
+					<div><strong>{c.name}</strong>: {c.detail}. Fix: <code>{c.fix}</code></div>
+				{/each}
+			</div>
+		{/if}
+		{#if usesNono}
+			<div class="notice small">
+				With nono the agent can read only system folders and the paths you grant, not your whole machine. nono cannot
+				hide or protect a path inside a folder the agent may use (on Linux), mask credentials, or read policy files. An
+				environment with a rule nono cannot enforce will not start.
+			</div>
+		{/if}
+
+		{#if !usesNono}
 		<Section title="Policy file" summary={policySummary} bind:open={openSection.policy}>
 			<div class="small muted">
 				Already have a sandbox-runtime config? Serebro can use it instead of the Files and Network settings below.
@@ -240,6 +283,7 @@
 			{/if}
 			<div class="small muted">You can create and edit the file on the environment page after saving.</div>
 		</Section>
+		{/if}
 
 		{#if fileInUse}
 			<div class="notice small">
@@ -249,7 +293,11 @@
 
 		<Section title="Files" summary={fsSummary} bind:open={openSection.files}>
 			<div class="small muted">
-				Reads are allowed everywhere except hidden paths. Writes are blocked everywhere except writable paths.
+				{#if usesNono}
+					Reads are limited to system folders and the paths granted here. Writes are blocked everywhere except writable paths.
+				{:else}
+					Reads are allowed everywhere except hidden paths. Writes are blocked everywhere except writable paths.
+				{/if}
 				Use absolute paths or <code>~/…</code>.
 			</div>
 			<div class="field-block">

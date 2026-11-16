@@ -1,14 +1,14 @@
-// A TanStack AI sandbox provider backed by Anthropic's sandbox-runtime (srt).
+// A TanStack AI sandbox provider backed by a local sandbox: Anthropic's sandbox-runtime
+// (srt) or nono.
 //
 // It reuses the local-process handle (real host folder, real process tree) and wraps
-// every command the harness runs in `srt --settings <file> -c '<command>'`. srt applies
-// the filesystem and network rules with bubblewrap (Linux) or Seatbelt (macOS) and
-// routes traffic through its filtering proxy.
+// every command the harness runs in the sandbox's launcher (see `wrapCommand`). The
+// sandbox applies the filesystem and network rules and routes traffic through its
+// filtering proxy.
 //
 // File reads and writes that TanStack AI itself makes through `handle.fs` (for example
 // writing a harness config file) run in this trusted server process, not in the sandbox.
 
-import { createRequire } from 'node:module';
 import path from 'node:path';
 import type {
 	ProcessOptions,
@@ -17,29 +17,13 @@ import type {
 	SandboxProvider
 } from '@tanstack/ai-sandbox';
 import { localProcessSandbox } from '@tanstack/ai-sandbox-local-process';
-import { Option } from 'effect';
-import { serverConfig } from './config.ts';
-
-const require = createRequire(import.meta.url);
-
-export function srtBinary(): string {
-	if (Option.isSome(serverConfig.srtBin)) return serverConfig.srtBin.value;
-	const pkg = require.resolve('@anthropic-ai/sandbox-runtime/package.json');
-	return path.join(path.dirname(pkg), 'dist', 'cli.js');
-}
-
-export function shellQuote(s: string) {
-	return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-export function wrapCommand(settingsFile: string, command: string) {
-	return `${shellQuote(process.execPath)} ${shellQuote(srtBinary())} --settings ${shellQuote(settingsFile)} -c ${shellQuote(command)}`;
-}
+import { wrapCommand, type WrapTarget } from './sandbox-backends.ts';
 
 /**
- * Host env vars srt itself needs. srt routes allowed traffic through an upstream proxy
- * when one is set (corporate networks), and inside the sandbox it replaces these with
- * its own filtering proxy, so the agent never talks to the upstream proxy directly.
+ * Host env vars the sandbox itself needs. srt routes allowed traffic through an upstream
+ * proxy when one is set (corporate networks); for nono the same proxy is written into its
+ * profile. Inside the sandbox these are replaced with the sandbox's own filtering proxy,
+ * so the agent never talks to the upstream proxy directly.
  */
 export const PROXY_ENV = [
 	'HTTPS_PROXY',
@@ -56,11 +40,9 @@ export function proxyEnv(): Record<string, string> {
 	return Object.fromEntries(PROXY_ENV.flatMap((k) => (process.env[k] ? [[k, process.env[k]!]] : [])));
 }
 
-export interface SrtSandboxConfig {
+export interface LocalSandboxConfig extends WrapTarget {
 	/** Host folder the agent works in. */
 	workspace: string;
-	/** Path to the generated srt settings JSON. */
-	settingsFile: string;
 	/** Env vars for every command (credentials, TMPDIR, harness flags). */
 	env: Record<string, string>;
 	/** Called with each wrapped command, for the activity log. */
@@ -81,14 +63,14 @@ const CAPS: SandboxCapabilities = {
 	fork: false
 };
 
-function wrapHandle(inner: SandboxHandle, config: SrtSandboxConfig): SandboxHandle {
+function wrapHandle(inner: SandboxHandle, config: LocalSandboxConfig): SandboxHandle {
 	const wrap = (command: string, options?: ProcessOptions): [string, ProcessOptions] => {
 		config.onCommand?.(command);
-		return [wrapCommand(config.settingsFile, command), { ...options, env: { ...config.env, ...options?.env } }];
+		return [wrapCommand(config, command), { ...options, env: { ...config.env, ...options?.env } }];
 	};
 	return {
 		id: inner.id,
-		provider: 'srt',
+		provider: config.backend,
 		workspaceRoot: path.resolve(config.workspace),
 		capabilities: CAPS,
 		fs: inner.fs,
@@ -103,7 +85,7 @@ function wrapHandle(inner: SandboxHandle, config: SrtSandboxConfig): SandboxHand
 	};
 }
 
-export function srtSandbox(config: SrtSandboxConfig): SandboxProvider {
+export function localSandbox(config: LocalSandboxConfig): SandboxProvider {
 	const local = localProcessSandbox({
 		dir: config.workspace,
 		removeOnDestroy: false,
@@ -111,7 +93,7 @@ export function srtSandbox(config: SrtSandboxConfig): SandboxProvider {
 		passEnv: ['USER', 'SHELL', 'TERM', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', ...PROXY_ENV]
 	});
 	return {
-		name: 'srt',
+		name: config.backend,
 		capabilities: () => CAPS,
 		create: async (input) => wrapHandle(await local.create(input), config),
 		resume: async (input) => {

@@ -23,6 +23,7 @@ const withDefault = <S extends Schema.Top>(schema: S, value: S['Encoded']) =>
 export const HarnessIdSchema = Schema.Literals(['claude-code', 'codex', 'grok-build', 'opencode', 'pi']);
 const CredentialMode = Schema.Literals(['direct', 'masked']);
 const PolicyFileMode = Schema.Literals(['auto', 'custom', 'off']);
+const SandboxChoice = Schema.Literals(['auto', 'srt', 'nono']);
 
 // ---------- stored data ----------
 
@@ -61,6 +62,8 @@ export const StoredEnvironment = Schema.Struct({
 	workspace: Schema.String,
 	harness: HarnessIdSchema,
 	model: Schema.String,
+	// Environments saved before nono support have no `sandbox`.
+	sandbox: withDefault(SandboxChoice, 'auto'),
 	filesystem: FilesystemConfig,
 	network: NetworkConfig,
 	// Environments saved before policy files existed have no `policyFile`.
@@ -102,6 +105,7 @@ const EnvironmentInputSchema = Schema.Struct({
 	),
 	harness: HarnessIdSchema.annotate(message('Pick a coding agent')),
 	model: withDefault(Text, ''),
+	sandbox: withDefault(SandboxChoice, 'auto'),
 	filesystem: withDefault(
 		Schema.Struct({ readWrite: InputList, denyRead: InputList, allowRead: InputList, denyWrite: InputList }),
 		{}
@@ -173,6 +177,7 @@ export const decodeEnvironmentInput = (body: unknown): Effect.Effect<Environment
 				workspace: b.workspace,
 				harness: b.harness,
 				model: b.model || 'default',
+				sandbox: b.sandbox,
 				filesystem: {
 					readWrite: clean(b.filesystem.readWrite),
 					denyRead: clean(b.filesystem.denyRead),

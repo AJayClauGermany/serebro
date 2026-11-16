@@ -39,6 +39,9 @@
 		<p class="pad muted">Fill in the form to see the effective access.</p>
 	{:else}
 		<div class="policy-src small">
+			Enforced by: <strong>{report.sandbox.label}</strong> <span class="muted">({report.sandbox.reason})</span>
+		</div>
+		<div class="policy-src small">
 			Rules from:
 			{#if report.policy.source === 'form'}
 				<strong>this environment's settings</strong>
@@ -62,15 +65,27 @@
 			<h3>Files</h3>
 			<div class="label ok">Can read + write</div>
 			<ul>{@render entries(report.filesystem.readWrite, 'Nothing')}</ul>
+			{#if report.filesystem.readOnly.length}
+				<div class="label ok">Can read</div>
+				<ul>{@render entries(report.filesystem.readOnly, '')}</ul>
+			{/if}
 			<div class="label bad">Cannot read</div>
-			<ul>{@render entries(report.filesystem.denyRead, 'Nothing hidden: the agent can read every file you can')}</ul>
+			<ul>
+				{@render entries(
+					report.filesystem.denyRead,
+					report.sandbox.id === 'nono' ? 'Nothing extra' : 'Nothing hidden: the agent can read every file you can'
+				)}
+			</ul>
 			{#if report.filesystem.allowRead.length}
 				<div class="label ok">Re-allowed for reading</div>
 				<ul>{@render entries(report.filesystem.allowRead, '')}</ul>
 			{/if}
 			<div class="label bad">Never writable</div>
 			<ul>{@render entries(report.filesystem.denyWrite, 'Nothing extra')}</ul>
-			<p class="small muted">{report.filesystem.readOnlyNote} Shell startup files and <code>.git/hooks</code> are always protected.</p>
+			<p class="small muted">
+				{report.filesystem.readOnlyNote}
+				{#if report.sandbox.id === 'srt'}Shell startup files and <code>.git/hooks</code> are always protected.{/if}
+			</p>
 		</div>
 
 		<div class="group">
@@ -103,9 +118,9 @@
 		{#if !compact}
 			<div class="group">
 				<button class="ghost small" onclick={() => (showRaw = !showRaw)}>
-					{showRaw ? '▾' : '▸'} Raw sandbox-runtime settings
+					{showRaw ? '▾' : '▸'} Raw {report.sandbox.id === 'nono' ? 'nono profile' : 'sandbox-runtime settings'}
 				</button>
-				{#if showRaw}<pre class="raw">{JSON.stringify(report.srtSettings, null, 2)}</pre>{/if}
+				{#if showRaw}<pre class="raw">{JSON.stringify(report.rawSettings, null, 2)}</pre>{/if}
 			</div>
 		{/if}
 	{/if}

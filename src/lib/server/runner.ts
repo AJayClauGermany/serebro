@@ -15,7 +15,8 @@ import { prepareSandbox } from './policy.ts';
 import { projectPolicyPath, workspacePath } from './policy-file.ts';
 import type { StoredEnvironment } from './schemas.ts';
 import { Store } from './store.ts';
-import { proxyEnv, shellQuote, srtSandbox, wrapCommand } from './srt-provider.ts';
+import { shellQuote, wrapCommand } from './sandbox-backends.ts';
+import { localSandbox, proxyEnv } from './sandbox-provider.ts';
 
 /**
  * Prepare the sandbox and start one agent turn. Setup problems (an invalid policy file, an
@@ -35,7 +36,8 @@ export const runAgent = Effect.fn('runAgent')(function* (opts: {
 
 	const sandbox = defineSandbox({
 		id: `serebro-${env.id}`,
-		provider: srtSandbox({
+		provider: localSandbox({
+			backend: compiled.backend,
 			workspace: workspacePath(env),
 			settingsFile,
 			env: compiled.env
@@ -159,7 +161,7 @@ const failed = (name: string, output: string): ProbeResult[] => [
  */
 export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: StoredEnvironment) {
 	const prepared = yield* prepareSandbox(env).pipe(Effect.catchTag('SandboxBlocked', Effect.succeed));
-	if (prepared instanceof SandboxBlocked) return failed('Policy file is valid', prepared.message);
+	if (prepared instanceof SandboxBlocked) return failed('Sandbox can start', prepared.message);
 	const { compiled, settingsFile } = prepared;
 	const cwd = workspacePath(env);
 	if (!fs.existsSync(cwd)) return failed('Workspace exists', `Missing: ${cwd}`);
@@ -180,7 +182,10 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 		{ name: 'Writes inside the workspace', command: `touch ${marker} && rm ${marker}`, expect: 'allowed' },
 		{ name: 'Writes outside the workspace', command: `touch ${outside}`, expect: 'blocked' },
 		{ name: 'Reads the Serebro data folder', command: canSee(DATA_DIR), expect: 'blocked' },
-		{ name: 'Changes its own policy file', command: `touch ${shellQuote(projectPolicyPath(env))}`, expect: 'blocked' },
+		// Only sandbox-runtime reads policy files; with nono there is no such file to protect.
+		...(compiled.backend === 'srt'
+			? [{ name: 'Changes its own policy file', command: `touch ${shellQuote(projectPolicyPath(env))}`, expect: 'blocked' as const }]
+			: []),
 		...(firstDenied
 			? [{ name: `Reads a denied path (${firstDenied})`, command: canSee(firstDenied.replace(/^~(?=$|\/)/, os.homedir())), expect: 'blocked' as const }]
 			: []),
@@ -193,7 +198,7 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 	];
 
 	return yield* Effect.forEach(probes, (p) =>
-		run(wrapCommand(settingsFile, p.command), cwd, compiled.env).pipe(
+		run(wrapCommand({ backend: compiled.backend, settingsFile }, p.command), cwd, compiled.env).pipe(
 			Effect.map((r): ProbeResult => {
 				const outcome = r.code === 0 ? 'allowed' : 'blocked';
 				return { ...p, outcome, pass: outcome === p.expect, output: redact(r.out, compiled.env) };

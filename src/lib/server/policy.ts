@@ -1,14 +1,17 @@
-// Turns an environment into (a) sandbox-runtime settings and (b) a plain-language access
-// report. Both come from the same function so the UI can never drift from what is enforced.
+// Turns an environment into (a) settings for its sandbox (sandbox-runtime or nono) and
+// (b) a plain-language access report. Both come from the same function so the UI can
+// never drift from what is enforced.
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Effect } from 'effect';
-import type { AccessEntry, AccessReport } from '#lib/types.ts';
+import type { AccessEntry, AccessReport, SandboxBackendId } from '#lib/types.ts';
 import { DATA_DIR } from './config.ts';
 import { FileSystemError, SandboxBlocked } from './errors.ts';
-import { getHarness, which } from './harnesses';
+import { getHarness, which, type HarnessDefinition } from './harnesses';
+import { compileNonoProfile, proxyHostPort } from './nono-policy.ts';
+import { resolveBackend, type ResolvedBackend } from './sandbox-backends.ts';
 import type { StoredEnvironment } from './schemas.ts';
 import { Store } from './store.ts';
 import { expandHome, hashText, policyCandidates, resolvePolicyFile, workspacePath } from './policy-file.ts';
@@ -44,12 +47,19 @@ export const PACKAGE_MANAGER_DOMAINS = [
 ];
 
 export interface CompiledPolicy {
+	backend: SandboxBackendId;
+	/** srt settings or a nono profile, depending on `backend`. */
 	settings: Record<string, unknown>;
 	report: AccessReport;
 	/** Env vars to put in every sandboxed command (includes secret values; server only). */
 	env: Record<string, string>;
 	tmpDir: string;
+	/** Folders to create before a run (nono can only grant paths that exist). */
+	createDirs: string[];
 }
+
+/** A missing path whose name has an extension (~/.claude.json) is a file, not a folder to create. */
+const looksLikeFile = (p: string) => /\.[A-Za-z0-9]+$/.test(path.basename(p).replace(/^\./, ''));
 
 function uniq(entries: AccessEntry[]): AccessEntry[] {
 	const seen = new Set<string>();
@@ -80,21 +90,69 @@ function protectedPolicyFiles(env: StoredEnvironment): AccessEntry[] {
 	}));
 }
 
+const realpath = (p: string) => {
+	try {
+		return fs.realpathSync(p);
+	} catch {
+		return null;
+	}
+};
+
+/**
+ * What an agent must be able to read to start at all under nono, where reads are an
+ * allow-list: its own program files, the Node.js install it runs on, and the machine's
+ * CA bundle when a corporate proxy is in use.
+ */
+function nonoReadNeeds(harness: HarnessDefinition): AccessEntry[] {
+	const out: AccessEntry[] = [];
+	const home = os.homedir();
+	const add = (dir: string | null, note: string) => {
+		// Never widen to a whole home folder or the filesystem root.
+		if (dir && dir !== home && dir !== path.parse(dir).root) out.push({ value: dir, source: 'runtime', note });
+	};
+	const node = realpath(which('node') ?? process.execPath);
+	if (node) add(path.dirname(path.dirname(node)), 'Node.js install (agents run on it)');
+	const bin = which(harness.binary);
+	const real = bin && realpath(bin);
+	if (real) add(path.dirname(real), `${harness.label} program files`);
+	for (const k of ['SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS']) {
+		const v = process.env[k];
+		if (v) out.push({ value: v, source: 'runtime', note: `CA bundle from ${k}` });
+	}
+	return out;
+}
+
 /**
  * Pure: the same environment and secrets always give the same settings and report.
  * (It does look at the disk to find policy files and installed binaries.)
  */
-export function compilePolicy(env: StoredEnvironment, secrets: Record<string, string>): CompiledPolicy {
+export function compilePolicy(
+	env: StoredEnvironment,
+	secrets: Record<string, string>,
+	backend: ResolvedBackend = resolveBackend(env.sandbox ?? 'auto'),
+	platform: NodeJS.Platform = os.platform()
+): CompiledPolicy {
 	const harness = getHarness(env.harness);
 	const warnings: string[] = [];
 	const tmpDir = tmpDirFor(env.id);
 	const workspace = workspacePath(env);
+	const nono = backend.id === 'nono';
 	const resolved = resolvePolicyFile(env);
-	const file = resolved.active;
+	// Policy files are sandbox-runtime files. nono never reads them (see the check below).
+	const file = nono ? null : resolved.active;
 	const fromFile = !!file;
-	let blocked: string | null = null;
+	const blocks: string[] = [];
+	if (backend.unavailable) blocks.push(backend.unavailable);
 	if (file && !file.validation.ok) {
-		blocked = `Policy file ${file.path} is invalid, so the sandbox will not start:\n${file.validation.errors.join('\n')}`;
+		blocks.push(`Policy file ${file.path} is invalid, so the sandbox will not start:\n${file.validation.errors.join('\n')}`);
+	}
+	if (nono && (env.policyFile?.mode ?? 'auto') !== 'off') {
+		// Refusing (rather than ignoring the file) keeps two promises: rules are never silently
+		// replaced, and a file the agent plants in the workspace can never become the policy if
+		// this environment later runs on sandbox-runtime.
+		blocks.push(
+			'Policy files are sandbox-runtime files and nono cannot use them. Set "Policy file" to Off to run this environment with nono.'
+		);
 	}
 	const fileConfig: Record<string, any> = file?.validation.config ?? {};
 	const addAgent = fromFile ? env.policyFile?.addAgentNeeds !== false : true;
@@ -108,7 +166,8 @@ export function compilePolicy(env: StoredEnvironment, secrets: Record<string, st
 	const runtimeDenyRead: AccessEntry[] = [{ value: DATA_DIR, source: 'runtime', note: 'Serebro data folder (holds your stored keys)' }];
 	const runtimeDenyWrite: AccessEntry[] = [
 		{ value: DATA_DIR, source: 'runtime', note: 'Serebro data folder' },
-		...protectedPolicyFiles(env)
+		// With nono, policy files are never read, so there is nothing to protect.
+		...(nono ? [] : protectedPolicyFiles(env))
 	];
 	const agentDomains =
 		(fromFile ? addAgent : env.network.harnessDefaults)
@@ -201,7 +260,7 @@ export function compilePolicy(env: StoredEnvironment, secrets: Record<string, st
 	if (workspace === os.homedir() || workspace === path.parse(workspace).root)
 		warnings.push(`The workspace is ${workspace}, so the agent can write almost everywhere. Pick a project folder instead.`);
 	if (!which(harness.binary)) warnings.push(`${harness.label} is not installed (\`${harness.binary}\` not on PATH). Install: ${harness.installHint}`);
-	if (env.harness === 'opencode' && os.platform() === 'linux')
+	if (env.harness === 'opencode' && platform === 'linux' && !nono)
 		warnings.push('OpenCode needs host-to-sandbox networking, which the Linux sandbox does not provide yet.');
 	if (!agentDomains.length && harness.domains.length && !harness.domains.every((d) => allowed.some((a) => a.value === d)))
 		warnings.push(`Agent API domains are off. ${harness.label} cannot reach ${harness.domains.join(', ')} unless you add them.`);
@@ -221,7 +280,7 @@ export function compilePolicy(env: StoredEnvironment, secrets: Record<string, st
 	);
 	const tlsNeeded = maskedEnvVars.length > 0;
 	const { network: _n, filesystem: _f, credentials: _c, ...otherFileKeys } = fileConfig;
-	const settings: Record<string, unknown> = {
+	const srtSettings = (): Record<string, unknown> => ({
 		...otherFileKeys,
 		network: {
 			...netIn,
@@ -240,13 +299,56 @@ export function compilePolicy(env: StoredEnvironment, secrets: Record<string, st
 		...(tlsNeeded || fileMaskedEnv.length
 			? { credentials: { ...fileCreds, envVars: [...fileMaskedEnv, ...maskedEnvVars] } }
 			: {})
-	};
+	});
+
+	// ---- nono profile ----
+	const readOnly: AccessEntry[] = nono ? uniq(nonoReadNeeds(harness)) : [];
+	let settings: Record<string, unknown>;
+	if (nono) {
+		const toAbs = (p: string) => path.resolve(workspace, expandHome(p));
+		const proxy = proxyHostPort(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy);
+		if (proxy.hasCredentials)
+			warnings.push('This machine\'s proxy needs a username and password, which nono cannot pass on. Allowed domains may be unreachable.');
+		const compiled = compileNonoProfile({
+			name: `serebro-${env.id}`,
+			platform,
+			readWrite: readWrite.map((e) => e.value),
+			readOnly: readOnly.map((e) => e.value),
+			denyRead,
+			denyWrite,
+			allowRead: allowRead.map((e) => e.value),
+			allowedDomains: allowed.map((e) => e.value),
+			deniedDomains: denied.map((e) => e.value),
+			localBinding,
+			upstreamProxy: proxy.hostPort,
+			maskedCredentials: masked.map((e) => e.value),
+			resolve: toAbs,
+			isFile: (p) => fs.statSync(p, { throwIfNoEntry: false })?.isFile() ?? false
+		});
+		settings = compiled.profile;
+		if (compiled.unenforceable.length)
+			blocks.push(
+				`nono cannot enforce ${compiled.unenforceable.length === 1 ? 'this rule' : 'these rules'}, so the sandbox will not start:\n${compiled.unenforceable.join('\n')}\nRemove the rule, or switch the environment to sandbox-runtime.`
+			);
+		// nono can only grant paths that exist. Folders are created before a run; files are not.
+		const missing = agentWrites.map((e) => e.value).filter((v) => looksLikeFile(v) && !fs.existsSync(toAbs(v)));
+		if (missing.length)
+			warnings.push(
+				`${missing.join(', ')} ${missing.length === 1 ? 'does' : 'do'} not exist yet, and nono cannot let the agent create ${missing.length === 1 ? 'it' : 'them'}. Run ${harness.label} once outside Serebro first.`
+			);
+	} else {
+		settings = srtSettings();
+	}
+	const blocked = blocks.length ? blocks.join('\n\n') : null;
 
 	const report: AccessReport = {
+		sandbox: { id: backend.id, label: backend.label, reason: backend.reason },
 		filesystem: {
 			readWrite,
-			readOnlyNote:
-				'Everything else on this machine is read-only, except the paths listed under "Cannot read". Writes anywhere else are blocked.',
+			readOnly,
+			readOnlyNote: nono
+				? 'Apart from these paths the agent can read only system folders (programs, libraries, certificates). The rest of this machine, including your home folder, is hidden. Writes anywhere else are blocked.'
+				: 'Everything else on this machine is read-only, except the paths listed under "Cannot read". Writes anywhere else are blocked.',
 			denyRead,
 			allowRead,
 			denyWrite
@@ -261,14 +363,20 @@ export function compilePolicy(env: StoredEnvironment, secrets: Record<string, st
 		policy: file
 			? { source: file.source, path: file.path, otherKeys: Object.keys(otherFileKeys) }
 			: { source: 'form', otherKeys: [] },
-		hash: hashText(JSON.stringify(settings) + (blocked ?? '')),
+		hash: hashText(backend.id + JSON.stringify(settings) + (blocked ?? '')),
 		blocked,
-		srtSettings: settings,
+		rawSettings: settings,
 		warnings
 	};
 
-	return { settings, report, env: childEnv, tmpDir };
+	const createDirs = nono
+		? agentWrites.map((e) => path.resolve(workspace, expandHome(e.value))).filter((p) => !looksLikeFile(p))
+		: [];
+	return { backend: backend.id, settings, report, env: childEnv, tmpDir, createDirs };
 }
+
+/** Policy files are sandbox-runtime files, so a starter is always written in srt's terms. */
+const SRT_FOR_STARTER: ResolvedBackend = { id: 'srt', label: 'sandbox-runtime (srt)', reason: '', unavailable: null };
 
 /**
  * A policy file built from the environment form, as a starting point. Serebro's own
@@ -276,7 +384,7 @@ export function compilePolicy(env: StoredEnvironment, secrets: Record<string, st
  */
 export function starterPolicy(env: StoredEnvironment): string {
 	const formEnv: StoredEnvironment = { ...env, policyFile: { ...env.policyFile, mode: 'off' } };
-	const { report } = compilePolicy(formEnv, {});
+	const { report } = compilePolicy(formEnv, {}, SRT_FOR_STARTER);
 	const pick = (list: AccessEntry[], drop: AccessEntry['source'][] = ['runtime']) =>
 		list.filter((e) => !drop.includes(e.source)).map((e) => (e.source === 'workspace' ? '.' : e.value));
 	const config = {
@@ -303,20 +411,28 @@ export const compileFor = (env: StoredEnvironment) =>
 	});
 
 /**
- * Compile the policy, refuse to continue if it is blocked, and write the srt settings
+ * Compile the policy, refuse to continue if it is blocked, and write the sandbox's settings
  * file. Returns the compiled policy and the settings file path.
  */
 export const prepareSandbox = Effect.fn('prepareSandbox')(function* (env: StoredEnvironment) {
 	const store = yield* Store;
 	const compiled = yield* compileFor(env);
 	if (compiled.report.blocked) return yield* new SandboxBlocked({ message: compiled.report.blocked });
-	const settingsFile = path.join(yield* store.sandboxDir(env.id), 'srt-settings.json');
+	const settingsFile = path.join(
+		yield* store.sandboxDir(env.id),
+		compiled.backend === 'nono' ? 'nono-profile.json' : 'srt-settings.json'
+	);
 	yield* Effect.tryPromise({
 		try: () => fs.promises.writeFile(settingsFile, JSON.stringify(compiled.settings, null, 2), { mode: 0o600 }),
 		catch: (cause) => new FileSystemError({ op: 'write', path: settingsFile, cause })
 	});
 	// sandbox-runtime always allows writes to /tmp/claude but only binds it if it exists.
-	for (const [dir, mode] of [[compiled.tmpDir, 0o700], ['/tmp/claude', undefined]] as const) {
+	const dirs: Array<readonly [string, number | undefined]> = [
+		[compiled.tmpDir, 0o700],
+		...(compiled.backend === 'srt' ? [['/tmp/claude', undefined] as const] : []),
+		...compiled.createDirs.map((d) => [d, 0o700] as const)
+	];
+	for (const [dir, mode] of dirs) {
 		yield* Effect.tryPromise({
 			try: () => fs.promises.mkdir(dir, { recursive: true, mode }),
 			catch: (cause) => new FileSystemError({ op: 'mkdir', path: dir, cause })

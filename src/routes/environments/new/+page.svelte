@@ -6,5 +6,5 @@
 </script>
 
 <main class="page">
-	<EnvironmentForm harnesses={data.harnesses} defaults={data.defaults} />
+	<EnvironmentForm harnesses={data.harnesses} sandboxes={data.sandboxes} defaults={data.defaults} />
 </main>
