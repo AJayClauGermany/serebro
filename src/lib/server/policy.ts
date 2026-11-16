@@ -11,7 +11,7 @@ import { DATA_DIR } from './config.ts';
 import { FileSystemError, SandboxBlocked } from './errors.ts';
 import { getHarness, which, type HarnessDefinition } from './harnesses';
 import { compileNonoProfile, proxyHostPort } from './nono-policy.ts';
-import { nonoPreflight, resolveBackend, type ResolvedBackend } from './sandbox-backends.ts';
+import { BACKEND_LABEL, nonoPreflight, resolveBackend, type ResolvedBackend } from './sandbox-backends.ts';
 import type { StoredEnvironment } from './schemas.ts';
 import { Store } from './store.ts';
 import { expandHome, hashText, policyCandidates, resolvePolicyFile, workspacePath } from './policy-file.ts';
@@ -160,9 +160,7 @@ export function compilePolicy(
 	env: StoredEnvironment,
 	secrets: Record<string, string>,
 	backend: ResolvedBackend = resolveBackend(env.sandbox ?? 'auto'),
-	platform: NodeJS.Platform = os.platform(),
-	/** Asks nono whether it accepts the profile. Replaced in tests. */
-	preflight: (profile: Record<string, unknown>) => string | null = nonoPreflight
+	platform: NodeJS.Platform = os.platform()
 ): CompiledPolicy {
 	const harness = getHarness(env.harness);
 	const warnings: string[] = [];
@@ -360,13 +358,8 @@ export function compilePolicy(
 		settings = compiled.profile;
 		if (compiled.unenforceable.length)
 			blocks.push(
-				`nono cannot enforce ${compiled.unenforceable.length === 1 ? 'this rule' : 'these rules'}, so the sandbox will not start:\n${compiled.unenforceable.join('\n')}\nRemove the rule, or switch the environment to sandbox-runtime.`
+				`nono cannot enforce ${compiled.unenforceable.length === 1 ? 'this rule' : 'these rules'}, so the sandbox will not start:\n${compiled.unenforceable.join('\n')}\nRemove the rule, or switch the environment to sandbox-runtime. A rule about the Serebro data folder cannot be removed: move that folder with SEREBRO_DATA_DIR, or pick another workspace.`
 			);
-		else if (!blocks.length && platform === os.platform()) {
-			// Serebro's own checks passed. nono has more (its protected folders, kernel support).
-			const refused = preflight(compiled.profile);
-			if (refused) blocks.push(`nono refuses this environment, so the sandbox will not start:\n${refused}`);
-		}
 		// nono can only grant paths that exist. Serebro creates the agent's folders before a run, nothing else.
 		const absent = readWrite
 			.filter((e) => e.source === 'you' || e.source === 'workspace')
@@ -448,11 +441,32 @@ export function starterPolicy(env: StoredEnvironment): string {
 	return JSON.stringify(config, null, 2) + '\n';
 }
 
+/**
+ * Add nono's own verdict to a compiled policy. Serebro's checks come first; when they pass,
+ * nono is asked to start an empty sandbox with the profile (its protected folders, kernel
+ * support and so on are things only it knows). A refusal blocks the environment.
+ */
+export const checkWithSandbox = Effect.fn('checkWithSandbox')(function* (compiled: CompiledPolicy) {
+	if (compiled.backend !== 'nono' || compiled.report.blocked) return compiled;
+	const refused = yield* nonoPreflight(compiled.settings);
+	return refused ? withRefusal(compiled, refused) : compiled;
+});
+
+/** Pure: the compiled policy, blocked with the sandbox's own reason. */
+export function withRefusal(compiled: CompiledPolicy, refused: string): CompiledPolicy {
+	const blocked = `${BACKEND_LABEL[compiled.backend]} refuses this environment, so the sandbox will not start:\n${refused}`;
+	return { ...compiled, report: { ...compiled.report, blocked, hash: hashText(compiled.report.hash + blocked) } };
+}
+
+/** Compile an environment's policy, including the sandbox's own check. */
+export const compileChecked = (env: StoredEnvironment, secrets: Record<string, string>) =>
+	checkWithSandbox(compilePolicy(env, secrets));
+
 /** Load the environment's secrets and compile its policy. */
 export const compileFor = (env: StoredEnvironment) =>
 	Effect.gen(function* () {
 		const store = yield* Store;
-		return compilePolicy(env, yield* store.getSecrets(env.id));
+		return yield* compileChecked(env, yield* store.getSecrets(env.id));
 	});
 
 /**

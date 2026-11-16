@@ -69,20 +69,22 @@ export function compileNonoProfile(input: NonoPolicyInput): NonoPolicy {
 	const granted = [...readWrite, ...readOnly, ...allowRead];
 
 	// ---- cannot read ----
+	// A rule Serebro added itself (its data folder) cannot be removed by the user: say what it is and what to move.
+	const what = (e: AccessEntry) => (e.source === 'runtime' && e.note ? `${e.note} (${e.value})` : `"${e.value}"`);
 	const deny: string[] = [];
 	for (const e of input.denyRead) {
 		const p = resolve(e.value);
 		const parent = granted.find((g) => isInside(p, g));
 		if (parent && linux) {
 			unenforceable.push(
-				`"${e.value}" cannot be hidden: it is inside ${parent}, which the agent may read. On Linux nono can only grant whole folders.`
+				`${what(e)} cannot be hidden: it is inside ${parent}, which the agent may read. On Linux nono can only grant whole folders.`
 			);
 			continue;
 		}
 		// A grant below the hidden path would stay readable on Linux. Re-allowed paths are meant to.
 		const child = [...readWrite, ...readOnly].find((g) => g !== p && isInside(g, p));
 		if (child && linux) {
-			unenforceable.push(`"${e.value}" cannot be hidden: ${child} is inside it and the agent may read that. On Linux nono cannot hide around a grant.`);
+			unenforceable.push(`${what(e)} cannot be hidden: ${child} is inside it and the agent may read that. On Linux nono cannot hide around a grant.`);
 			continue;
 		}
 		// Outside every grant the path is unreadable anyway; the explicit deny also covers nono's own defaults.
@@ -95,9 +97,9 @@ export function compileNonoProfile(input: NonoPolicyInput): NonoPolicy {
 		const parent = readWrite.find((g) => isInside(p, g));
 		const child = readWrite.find((g) => isInside(g, p));
 		if (parent) {
-			unenforceable.push(`"${e.value}" cannot be made read-only: it is inside ${parent}, which the agent may write. nono has no write-only block.`);
+			unenforceable.push(`${what(e)} cannot be made read-only: it is inside ${parent}, which the agent may write. nono has no write-only block.`);
 		} else if (child) {
-			unenforceable.push(`"${e.value}" cannot be made read-only: ${child} is inside it and the agent may write that. nono has no write-only block.`);
+			unenforceable.push(`${what(e)} cannot be made read-only: ${child} is inside it and the agent may write that. nono has no write-only block.`);
 		}
 		// Otherwise nothing in or around it is writable: writes are an allow-list.
 	}
@@ -151,8 +153,17 @@ export function compileNonoProfile(input: NonoPolicyInput): NonoPolicy {
 		// nono keeps its own session records under XDG_STATE_HOME, which Serebro points at its data
 		// folder for the launcher. The agent must not inherit that.
 		environment: { deny_vars: ['XDG_STATE_HOME'] },
-		// A network namespace with its own loopback. Needs user namespaces; nono refuses to start without them.
-		...(input.localBinding && linux ? { linux: { isolate: { network: true, loopback: true } } } : {})
+		...(linux
+			? {
+					linux: {
+						// Landlock's network rules cover TCP only. Without this the agent could talk to any Unix
+						// socket the user can (Docker, ssh-agent, the session bus), wherever the socket file is.
+						af_unix_mediation: 'pathname',
+						// A network namespace with its own loopback. Needs user namespaces; nono refuses to start without them.
+						...(input.localBinding ? { isolate: { network: true, loopback: true } } : {})
+					}
+				}
+			: {})
 	};
 
 	return { profile, unenforceable };

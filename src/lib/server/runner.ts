@@ -203,6 +203,16 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 	// shares the machine's network unless told otherwise, so check the agent cannot reach it.
 	// (srt differs by platform here, so its behaviour is left as it was.)
 	const local = compiled.backend === 'nono' ? yield* listenOnLoopback : null;
+	// The same for Unix sockets, which are not part of the network rules: Docker, ssh-agent and
+	// the session bus all listen on one.
+	const sockDir = compiled.backend === 'nono' && os.platform() === 'linux' ? fs.mkdtempSync(path.join(os.tmpdir(), 'serebro-probe-')) : null;
+	const unix = sockDir ? yield* listenOnSocket(path.join(sockDir, 'probe.sock')) : null;
+	if (sockDir)
+		probes.push({
+			name: 'Connects to a Unix socket on this machine',
+			command: `curl -sS -m 5 --unix-socket ${shellQuote(path.join(sockDir, 'probe.sock'))} -o /dev/null http://localhost/`,
+			expect: 'blocked'
+		});
 	if (local) {
 		const port = (local.address() as net.AddressInfo).port;
 		probes.push({
@@ -225,16 +235,28 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 			Effect.sync(() => {
 				fs.rmSync(outside, { force: true });
 				local?.close();
+				unix?.close();
+				if (sockDir) fs.rmSync(sockDir, { recursive: true, force: true });
 			})
 		)
 	);
 });
 
+const probeServer = () =>
+	net.createServer((socket) => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'));
+
 /** A throwaway HTTP-ish listener on 127.0.0.1, on a port the system picks. */
 const listenOnLoopback = Effect.callback<net.Server>((resume) => {
-	const server = net.createServer((socket) => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'));
+	const server = probeServer();
 	server.listen(0, '127.0.0.1', () => resume(Effect.succeed(server)));
 });
+
+/** The same, on a Unix socket. */
+const listenOnSocket = (file: string) =>
+	Effect.callback<net.Server>((resume) => {
+		const server = probeServer();
+		server.listen(file, () => resume(Effect.succeed(server)));
+	});
 
 /** Exit 0 only if the path's content is visible (a denied folder shows up empty). */
 function canSee(p: string) {

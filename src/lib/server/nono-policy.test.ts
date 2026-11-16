@@ -111,13 +111,13 @@ describe('compileNonoProfile', () => {
 	it('filters domains and chains the host proxy', () => {
 		const r = compile({ deniedDomains: ['evil.example'], upstreamProxy: 'proxy:3128' });
 		expect(r.profile.network).toEqual({ allow_domain: ['api.anthropic.com'], deny_domain: ['evil.example'], upstream_proxy: 'proxy:3128' });
-		expect(r.profile).not.toHaveProperty('linux');
+		expect(r.profile.linux).toEqual({ af_unix_mediation: 'pathname' });
 	});
 
 	it('gives local ports a loopback of their own on Linux, never the machine\'s localhost', () => {
 		const r = compile({ localBinding: true });
 		expect(r.unenforceable).toEqual([]);
-		expect(r.profile.linux).toEqual({ isolate: { network: true, loopback: true } });
+		expect(r.profile.linux).toEqual({ af_unix_mediation: 'pathname', isolate: { network: true, loopback: true } });
 		expect(JSON.stringify(r.profile)).not.toMatch(/open_port|listen_port|connect_port/);
 	});
 
@@ -125,6 +125,18 @@ describe('compileNonoProfile', () => {
 		const r = compile({ platform: 'darwin', localBinding: true });
 		expect(r.unenforceable[0]).toMatch(/Local ports cannot be opened/);
 		expect(JSON.stringify(r.profile)).not.toMatch(/open_port|listen_port|connect_port/);
+	});
+
+	it('closes Unix sockets on every Linux profile, with or without local ports', () => {
+		expect(compile().profile.linux).toEqual({ af_unix_mediation: 'pathname' });
+		expect(compile({ platform: 'darwin' }).profile).not.toHaveProperty('linux');
+	});
+
+	it('names a rule Serebro added itself, since the user cannot remove it', () => {
+		const data: AccessEntry = { value: '/work/app/.serebro', source: 'runtime', note: 'Serebro data folder' };
+		const r = compile({ denyRead: [data], denyWrite: [data] });
+		expect(r.unenforceable).toHaveLength(2);
+		for (const m of r.unenforceable) expect(m).toMatch(/^Serebro data folder \(\/work\/app\/\.serebro\) cannot be/);
 	});
 
 	it('keeps nono\'s state folder variable out of the agent\'s environment', () => {

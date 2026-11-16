@@ -5,12 +5,12 @@
 // A sandbox that was asked for by name is never swapped for another one: if it cannot
 // run, the environment is blocked.
 
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import { Option } from 'effect';
+import { Effect, Option } from 'effect';
 import type { SandboxBackendId, SandboxBackendInfo, SandboxChoice, SystemCheck } from '#lib/types.ts';
 import { serverConfig } from './config.ts';
 import { which } from './harnesses.ts';
@@ -47,18 +47,53 @@ function srtChecks(platform: NodeJS.Platform): SystemCheck[] {
 		return { name: `${bin} (${why})`, ok: !!at, detail: at ?? 'not found', fix };
 	};
 	if (platform === 'linux') {
-		return (
+		const tools = (
 			[
 				['bwrap', 'bubblewrap', 'filesystem and process isolation'],
 				['socat', 'socat', 'network proxy bridge'],
 				['rg', 'ripgrep', 'scanning for protected files']
 			] as const
 		).map(([bin, pkg, why]) => tool(bin, why, `sudo apt-get install ${pkg}   # or your distro's equivalent`));
+		// Installed is not the same as working: in a container without user namespaces bubblewrap
+		// is on PATH and fails on every command.
+		const bwrap = tools[0];
+		if (bwrap.ok) {
+			const refusal = bwrapRefusal(bwrap.detail);
+			tools.push({
+				name: 'bubblewrap can start a sandbox',
+				ok: refusal === null,
+				detail: refusal ?? 'yes',
+				fix: 'Allow unprivileged user namespaces on this machine, or install nono and use that'
+			});
+		}
+		return tools;
 	}
 	if (platform === 'darwin') {
 		return [tool('sandbox-exec', 'Seatbelt', 'Built into macOS'), tool('rg', 'ripgrep', 'brew install ripgrep')];
 	}
 	return [{ name: 'Supported platform', ok: false, detail: platform, fix: 'sandbox-runtime supports Linux and macOS.' }];
+}
+
+const bwrapProbes = new Map<string, { at: number; refusal: string | null }>();
+
+/**
+ * Start the emptiest sandbox sandbox-runtime could ask for (its own network and process
+ * namespaces) and return bubblewrap's complaint, or null when it works. Asked once a minute.
+ */
+function bwrapRefusal(bwrap: string): string | null {
+	const cached = bwrapProbes.get(bwrap);
+	if (cached && Date.now() - cached.at < 60_000) return cached.refusal;
+	const r = spawnSync(bwrap, ['--unshare-net', '--unshare-pid', '--dev-bind', '/', '/', 'true'], {
+		timeout: 3000,
+		stdio: ['ignore', 'ignore', 'pipe'],
+		encoding: 'utf8'
+	});
+	const refusal =
+		r.error === undefined && r.status === 0
+			? null
+			: (r.stderr ?? '').split('\n').map((l) => l.trim()).find(Boolean)?.slice(0, 200) || r.error?.message || `exit ${r.status}`;
+	bwrapProbes.set(bwrap, { at: Date.now(), refusal });
+	return refusal;
 }
 
 function nonoChecks(platform: NodeJS.Platform): SystemCheck[] {
@@ -150,37 +185,56 @@ export function wrapCommand(target: WrapTarget, command: string, bin: string | n
 	return `${shellQuote(process.execPath)} ${shellQuote(srtBinary())} --settings ${shellQuote(target.settingsFile)} -c ${shellQuote(command)}`;
 }
 
-const preflightCache = new Map<string, string | null>();
+interface Preflight {
+	at: number;
+	result: Promise<string | null>;
+	failed?: boolean;
+}
+const preflights = new Map<string, Preflight>();
+/** A pass is trusted for a while. A refusal can depend on the machine, so it is asked again soon. */
+const PREFLIGHT_OK_MS = 5 * 60 * 1000;
+const PREFLIGHT_REFUSED_MS = 15 * 1000;
+
+async function runPreflight(bin: string, text: string): Promise<string | null> {
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'serebro-nono-'));
+	try {
+		const file = path.join(dir, 'profile.json');
+		await fs.promises.writeFile(file, text, { mode: 0o600 });
+		const command = `${nonoLauncher(bin, file, path.join(dir, 'state'))} /bin/sh -c true`;
+		return await new Promise<string | null>((resolve) => {
+			execFile(
+				'/bin/sh',
+				['-c', command],
+				{ cwd: dir, timeout: 15000, env: { PATH: process.env.PATH ?? '', HOME: os.homedir() } },
+				(err, stdout, stderr) => {
+					if (!err) return resolve(null);
+					resolve(`${stdout}${stderr}`.trim().slice(-1500) || `nono did not start (${err.message})`);
+				}
+			);
+		});
+	} finally {
+		await fs.promises.rm(dir, { recursive: true, force: true });
+	}
+}
 
 /**
  * Ask nono itself whether it accepts a profile, by starting a sandbox that runs nothing.
  * nono has checks Serebro does not repeat (its own protected folders, kernel support for
  * what the profile asks). Running it here puts a refusal in the access panel instead of in
- * the middle of a chat. Returns nono's message, or null when the profile starts.
+ * the middle of a chat. Succeeds with nono's message, or null when the profile starts.
+ * Never blocks the server: only the request that needs the answer waits for it.
  */
-export function nonoPreflight(profile: Record<string, unknown>): string | null {
-	const bin = nonoBinary();
-	if (!bin) return null; // Reported as "cannot run on this machine" by the caller.
-	const text = JSON.stringify(profile);
-	const cached = preflightCache.get(text);
-	if (cached !== undefined) return cached;
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'serebro-nono-'));
-	let result: string | null;
-	try {
-		const file = path.join(dir, 'profile.json');
-		fs.writeFileSync(file, text, { mode: 0o600 });
-		const r = spawnSync('/bin/sh', ['-c', `${nonoLauncher(bin, file, path.join(dir, 'state'))} /bin/sh -c true`], {
-			cwd: dir,
-			encoding: 'utf8',
-			timeout: 15000,
-			stdio: ['ignore', 'pipe', 'pipe'],
-			env: { PATH: process.env.PATH ?? '', HOME: os.homedir() }
-		});
-		result = r.status === 0 ? null : (`${r.stdout}${r.stderr}`.trim().slice(-1500) || `nono did not start (${r.error?.message ?? `exit ${r.status}`})`);
-	} finally {
-		fs.rmSync(dir, { recursive: true, force: true });
-	}
-	if (preflightCache.size > 200) preflightCache.clear();
-	preflightCache.set(text, result);
-	return result;
-}
+export const nonoPreflight = (profile: Record<string, unknown>): Effect.Effect<string | null> =>
+	Effect.promise(async () => {
+		const bin = nonoBinary();
+		if (!bin) return null; // Reported as "cannot run on this machine" by the caller.
+		const key = `${bin}\n${JSON.stringify(profile)}`;
+		const cached = preflights.get(key);
+		if (cached && Date.now() - cached.at < (cached.failed ? PREFLIGHT_REFUSED_MS : PREFLIGHT_OK_MS)) return cached.result;
+		if (preflights.size > 200) preflights.clear();
+		const entry: Preflight = { at: Date.now(), result: runPreflight(bin, JSON.stringify(profile)) };
+		preflights.set(key, entry);
+		const result = await entry.result;
+		entry.failed = result !== null;
+		return result;
+	});
