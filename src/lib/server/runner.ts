@@ -1,6 +1,7 @@
 // Starts agent runs and sandbox self-tests for an environment.
 
 import { execFile } from 'node:child_process';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -31,7 +32,7 @@ export const runAgent = Effect.fn('runAgent')(function* (opts: {
 	const { env, session, messages, signal } = opts;
 	const store = yield* Store;
 	const harness = getHarness(session.harness);
-	const { compiled, settingsFile } = yield* prepareSandbox(env);
+	const { compiled, settingsFile, stateDir } = yield* prepareSandbox(env);
 	yield* Effect.annotateCurrentSpan({ environment: env.id, session: session.id, harness: harness.id });
 
 	const sandbox = defineSandbox({
@@ -40,6 +41,7 @@ export const runAgent = Effect.fn('runAgent')(function* (opts: {
 			backend: compiled.backend,
 			workspace: workspacePath(env),
 			settingsFile,
+			stateDir,
 			env: compiled.env
 		}),
 		lifecycle: { reuse: 'thread', destroyOnComplete: false },
@@ -162,7 +164,7 @@ const failed = (name: string, output: string): ProbeResult[] => [
 export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: StoredEnvironment) {
 	const prepared = yield* prepareSandbox(env).pipe(Effect.catchTag('SandboxBlocked', Effect.succeed));
 	if (prepared instanceof SandboxBlocked) return failed('Sandbox can start', prepared.message);
-	const { compiled, settingsFile } = prepared;
+	const { compiled, settingsFile, stateDir } = prepared;
 	const cwd = workspacePath(env);
 	if (!fs.existsSync(cwd)) return failed('Workspace exists', `Missing: ${cwd}`);
 
@@ -197,8 +199,21 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 			: [])
 	];
 
+	// A stand-in for any service on this machine's localhost (Serebro's own API is one). nono
+	// shares the machine's network unless told otherwise, so check the agent cannot reach it.
+	// (srt differs by platform here, so its behaviour is left as it was.)
+	const local = compiled.backend === 'nono' ? yield* listenOnLoopback : null;
+	if (local) {
+		const port = (local.address() as net.AddressInfo).port;
+		probes.push({
+			name: "Reaches a service on this machine's localhost",
+			command: `curl -sS -m 5 --noproxy '*' -o /dev/null http://127.0.0.1:${port}/`,
+			expect: 'blocked'
+		});
+	}
+
 	return yield* Effect.forEach(probes, (p) =>
-		run(wrapCommand({ backend: compiled.backend, settingsFile }, p.command), cwd, compiled.env).pipe(
+		run(wrapCommand({ backend: compiled.backend, settingsFile, stateDir }, p.command), cwd, compiled.env).pipe(
 			Effect.map((r): ProbeResult => {
 				const outcome = r.code === 0 ? 'allowed' : 'blocked';
 				return { ...p, outcome, pass: outcome === p.expect, output: redact(r.out, compiled.env) };
@@ -206,8 +221,19 @@ export const probeEnvironment = Effect.fn('probeEnvironment')(function* (env: St
 		)
 	).pipe(
 		// Remove the marker even if the probe is interrupted (the browser went away).
-		Effect.ensuring(Effect.sync(() => fs.rmSync(outside, { force: true })))
+		Effect.ensuring(
+			Effect.sync(() => {
+				fs.rmSync(outside, { force: true });
+				local?.close();
+			})
+		)
 	);
+});
+
+/** A throwaway HTTP-ish listener on 127.0.0.1, on a port the system picks. */
+const listenOnLoopback = Effect.callback<net.Server>((resume) => {
+	const server = net.createServer((socket) => socket.end('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'));
+	server.listen(0, '127.0.0.1', () => resume(Effect.succeed(server)));
 });
 
 /** Exit 0 only if the path's content is visible (a denied folder shows up empty). */

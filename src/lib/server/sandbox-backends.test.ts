@@ -38,4 +38,19 @@ describe('wrapCommand', () => {
 		const out = wrapCommand({ backend: 'srt', settingsFile: '/data/s.json' }, "echo 'hi'");
 		expect(out).toContain(`--settings '/data/s.json' -c 'echo '\\''hi'\\'''`);
 	});
+
+	it('quotes the binary, profile, state folder and command for nono', () => {
+		const out = wrapCommand(
+			{ backend: 'nono', settingsFile: "/data dir/pro'file.json", stateDir: '/data dir/state' },
+			'echo "$(id)" `x`',
+			"/opt/no'no $(touch PWNED)"
+		);
+		expect(out).toBe(
+			`env XDG_STATE_HOME='/data dir/state' '/opt/no'\\''no $(touch PWNED)' --silent run --no-audit --no-rollback --profile '/data dir/pro'\\''file.json' -- /bin/sh -c 'echo "$(id)" \`x\`'`
+		);
+	});
+
+	it('refuses to build a nono command when nono is missing', () => {
+		expect(() => wrapCommand({ backend: 'nono', settingsFile: '/p.json' }, 'true', null)).toThrow(/not installed/);
+	});
 });

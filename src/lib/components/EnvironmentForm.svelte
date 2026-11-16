@@ -59,6 +59,17 @@
 	// The sandbox that will actually run: the chosen one, or the one "auto" picks on this machine.
 	const backend = $derived(sandboxes.find((b) => (sandbox === 'auto' ? b.preferred : b.id === sandbox)) ?? sandboxes[0]);
 	const usesNono = $derived(backend.id === 'nono');
+	// The pre-filled "never writable" rules cannot be enforced by nono and would block the
+	// environment. Follow the sandbox while the list is still the untouched default; a list
+	// the user has edited is theirs and is left alone (it blocks, and says why).
+	const SEED_DENY_WRITE = ['.env', '.env.local'];
+	const sameList = (a: string[], b: string[]) => a.length === b.length && a.every((v, i) => v === b[i]);
+	$effect(() => {
+		if (init) return;
+		const current = untrack(() => denyWrite);
+		if (usesNono && sameList(current, SEED_DENY_WRITE)) denyWrite = [];
+		else if (!usesNono && current.length === 0) denyWrite = [...SEED_DENY_WRITE];
+	});
 	let policyMode = $state(init?.policyFile.mode ?? 'auto');
 	let policyPath = $state(init?.policyFile.path ?? '');
 	let addAgentNeeds = $state(init?.policyFile.addAgentNeeds ?? true);
@@ -247,7 +258,8 @@
 			<div class="notice small">
 				With nono the agent can read only system folders and the paths you grant, not your whole machine. nono cannot
 				hide or protect a path inside a folder the agent may use (on Linux), mask credentials, or read policy files. An
-				environment with a rule nono cannot enforce will not start.
+				environment with a rule nono cannot enforce will not start. Unlike sandbox-runtime, nono does not hide other
+				running programs from the agent or stop permission changes (chmod) on your files.
 			</div>
 		{/if}
 

@@ -85,18 +85,50 @@ describe('compileNonoProfile', () => {
 		expect(fsOf(r).bypass_protection).toEqual(['/home/me/.ssh/known_hosts']);
 	});
 
+	it('refuses a read-only rule that is a parent of a writable folder', () => {
+		const r = compile({ denyWrite: [you('/work')] });
+		expect(r.unenforceable[0]).toMatch(/"\/work" cannot be made read-only: \/work\/app is inside it/);
+	});
+
+	it('refuses to hide a folder that contains a grant on Linux', () => {
+		expect(compile({ denyRead: [you('/home/me')] }).unenforceable[0]).toMatch(/cannot be hidden: \/home\/me\/\.claude is inside it/);
+		// A re-allowed path inside a hidden folder is the intended exception.
+		expect(compile({ denyRead: [you('~/.ssh')], allowRead: ['~/.ssh/known_hosts'] }).unenforceable).toEqual([]);
+	});
+
+	it('compares real locations, so a rule spelled through a symlink still matches', () => {
+		// /work/link is a symlink to /work/app.
+		const viaLink = (p: string) => base.resolve(p).replace(/^\/work\/link(?=\/|$)/, '/work/app');
+		const r = compileNonoProfile({ ...base, readWrite: ['/work/link'], denyWrite: [you('/work/app/.env')], denyRead: [you('/work/app/secret')], resolve: viaLink });
+		expect(r.unenforceable).toHaveLength(2);
+		expect(fsOf(r).allow).toContain('/work/app');
+	});
+
 	it('blocks the network when no domain is allowed', () => {
 		expect(compile({ allowedDomains: [] }).profile.network).toEqual({ block: true });
 	});
 
-	it('filters domains, chains the host proxy and opens local ports when asked', () => {
-		const r = compile({ deniedDomains: ['evil.example'], upstreamProxy: 'proxy:3128', localBinding: true });
-		expect(r.profile.network).toEqual({
-			allow_domain: ['api.anthropic.com'],
-			deny_domain: ['evil.example'],
-			upstream_proxy: 'proxy:3128',
-			open_port_range: [[1024, 65535]]
-		});
+	it('filters domains and chains the host proxy', () => {
+		const r = compile({ deniedDomains: ['evil.example'], upstreamProxy: 'proxy:3128' });
+		expect(r.profile.network).toEqual({ allow_domain: ['api.anthropic.com'], deny_domain: ['evil.example'], upstream_proxy: 'proxy:3128' });
+		expect(r.profile).not.toHaveProperty('linux');
+	});
+
+	it('gives local ports a loopback of their own on Linux, never the machine\'s localhost', () => {
+		const r = compile({ localBinding: true });
+		expect(r.unenforceable).toEqual([]);
+		expect(r.profile.linux).toEqual({ isolate: { network: true, loopback: true } });
+		expect(JSON.stringify(r.profile)).not.toMatch(/open_port|listen_port|connect_port/);
+	});
+
+	it('refuses local ports on macOS, where only the machine\'s localhost can be opened', () => {
+		const r = compile({ platform: 'darwin', localBinding: true });
+		expect(r.unenforceable[0]).toMatch(/Local ports cannot be opened/);
+		expect(JSON.stringify(r.profile)).not.toMatch(/open_port|listen_port|connect_port/);
+	});
+
+	it('keeps nono\'s state folder variable out of the agent\'s environment', () => {
+		expect(compile().profile.environment).toEqual({ deny_vars: ['XDG_STATE_HOME'] });
 	});
 });
 

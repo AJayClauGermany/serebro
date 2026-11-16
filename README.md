@@ -67,10 +67,15 @@ nono is found on `PATH`, or set `SEREBRO_NONO_BIN` to its location. It differs f
 | **Making a path read-only inside a writable folder** | Yes | No. The environment is blocked. |
 | **Masked credentials** | Yes (experimental) | Not supported yet. The environment is blocked. |
 | **Policy files** | Yes | No. **Policy file** must be Off. |
-| **Local ports** | Yes | Yes (IPv4, Linux 6.7 or newer) |
+| **Local ports** | Yes | Linux only, and only where user namespaces are available: the agent gets a loopback of its own (IPv4) and cannot reach services on this machine's localhost. On macOS the environment is blocked. |
+| **Other running programs** | Hidden | Visible: names and command lines, and their environment variables when Serebro runs as root |
+| **Permission changes (`chmod`) on files outside the workspace** | Blocked | Not blocked for files you own. Content, deletes and renames are blocked. |
+| **Writable folders that do not exist yet** | The agent can create them | The agent cannot. Serebro creates the agent's own folders and warns about the rest. |
 | **Needs** | bubblewrap, socat, ripgrep on Linux | One binary; Linux 5.13 or newer with Landlock |
 
 With nono the access panel also lists what the agent can read: its own program files, the Node.js install, and the machine's CA bundle when a proxy is in use.
+
+Before an environment is shown as ready, Serebro asks nono to start an empty sandbox with the generated profile, so anything nono itself refuses (for example local ports on a machine without user namespaces) appears in the access panel and not in the middle of a chat. nono's per-command session records are kept in the environment's folder under the Serebro data folder, and pruned after a day.
 
 ## Using your own policy file
 

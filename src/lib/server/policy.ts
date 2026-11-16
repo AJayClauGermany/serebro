@@ -11,7 +11,7 @@ import { DATA_DIR } from './config.ts';
 import { FileSystemError, SandboxBlocked } from './errors.ts';
 import { getHarness, which, type HarnessDefinition } from './harnesses';
 import { compileNonoProfile, proxyHostPort } from './nono-policy.ts';
-import { resolveBackend, type ResolvedBackend } from './sandbox-backends.ts';
+import { nonoPreflight, resolveBackend, type ResolvedBackend } from './sandbox-backends.ts';
 import type { StoredEnvironment } from './schemas.ts';
 import { Store } from './store.ts';
 import { expandHome, hashText, policyCandidates, resolvePolicyFile, workspacePath } from './policy-file.ts';
@@ -99,25 +99,55 @@ const realpath = (p: string) => {
 };
 
 /**
+ * The real location of a path that may not exist yet: follow symlinks in the part that
+ * exists, then add the rest back. Rules and grants are compared in this form, so a
+ * symlinked workspace and a rule written against its target are seen as the same place.
+ */
+export function canonicalPath(p: string): string {
+	const abs = path.resolve(p);
+	const rest: string[] = [];
+	let cur = abs;
+	for (;;) {
+		const real = realpath(cur);
+		if (real) return rest.length ? path.join(real, ...rest.reverse()) : real;
+		const parent = path.dirname(cur);
+		if (parent === cur) return abs;
+		rest.push(path.basename(cur));
+		cur = parent;
+	}
+}
+
+const isDir = (p: string) => fs.statSync(p, { throwIfNoEntry: false })?.isDirectory() ?? false;
+
+/**
  * What an agent must be able to read to start at all under nono, where reads are an
  * allow-list: its own program files, the Node.js install it runs on, and the machine's
- * CA bundle when a corporate proxy is in use.
+ * CA bundle when a corporate proxy is in use. Each grant is as narrow as it can be: a
+ * program that does not sit in an install folder of its own is granted as a single file,
+ * never as the folder around it (which could be ~/.local or ~/bin).
  */
 function nonoReadNeeds(harness: HarnessDefinition): AccessEntry[] {
 	const out: AccessEntry[] = [];
-	const home = os.homedir();
-	const add = (dir: string | null, note: string) => {
-		// Never widen to a whole home folder or the filesystem root.
-		if (dir && dir !== home && dir !== path.parse(dir).root) out.push({ value: dir, source: 'runtime', note });
-	};
+	const add = (value: string, note: string) => out.push({ value, source: 'runtime', note });
 	const node = realpath(which('node') ?? process.execPath);
-	if (node) add(path.dirname(path.dirname(node)), 'Node.js install (agents run on it)');
+	if (node) {
+		// <prefix>/bin/node with <prefix>/lib/node_modules next to it is a Node.js install folder.
+		const prefix = path.dirname(path.dirname(node));
+		const isPrefix = path.basename(path.dirname(node)) === 'bin' && isDir(path.join(prefix, 'lib', 'node_modules'));
+		if (isPrefix && path.dirname(prefix) !== prefix) add(prefix, 'Node.js install (agents run on it)');
+		else add(node, 'Node.js program');
+	}
 	const bin = which(harness.binary);
 	const real = bin && realpath(bin);
-	if (real) add(path.dirname(real), `${harness.label} program files`);
-	for (const k of ['SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS']) {
+	if (real) {
+		const dir = path.dirname(real);
+		// A program inside a "bin" folder shares it with unrelated files: grant only the program.
+		if (path.basename(dir) === 'bin' || dir === os.homedir() || path.dirname(dir) === dir) add(real, `${harness.label} program`);
+		else add(dir, `${harness.label} program files`);
+	}
+	for (const k of ['SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_DIR']) {
 		const v = process.env[k];
-		if (v) out.push({ value: v, source: 'runtime', note: `CA bundle from ${k}` });
+		if (v) add(v, `CA certificates from ${k}`);
 	}
 	return out;
 }
@@ -130,7 +160,9 @@ export function compilePolicy(
 	env: StoredEnvironment,
 	secrets: Record<string, string>,
 	backend: ResolvedBackend = resolveBackend(env.sandbox ?? 'auto'),
-	platform: NodeJS.Platform = os.platform()
+	platform: NodeJS.Platform = os.platform(),
+	/** Asks nono whether it accepts the profile. Replaced in tests. */
+	preflight: (profile: Record<string, unknown>) => string | null = nonoPreflight
 ): CompiledPolicy {
 	const harness = getHarness(env.harness);
 	const warnings: string[] = [];
@@ -305,7 +337,7 @@ export function compilePolicy(
 	const readOnly: AccessEntry[] = nono ? uniq(nonoReadNeeds(harness)) : [];
 	let settings: Record<string, unknown>;
 	if (nono) {
-		const toAbs = (p: string) => path.resolve(workspace, expandHome(p));
+		const toAbs = (p: string) => canonicalPath(path.resolve(workspace, expandHome(p)));
 		const proxy = proxyHostPort(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy);
 		if (proxy.hasCredentials)
 			warnings.push('This machine\'s proxy needs a username and password, which nono cannot pass on. Allowed domains may be unreachable.');
@@ -330,7 +362,20 @@ export function compilePolicy(
 			blocks.push(
 				`nono cannot enforce ${compiled.unenforceable.length === 1 ? 'this rule' : 'these rules'}, so the sandbox will not start:\n${compiled.unenforceable.join('\n')}\nRemove the rule, or switch the environment to sandbox-runtime.`
 			);
-		// nono can only grant paths that exist. Folders are created before a run; files are not.
+		else if (!blocks.length && platform === os.platform()) {
+			// Serebro's own checks passed. nono has more (its protected folders, kernel support).
+			const refused = preflight(compiled.profile);
+			if (refused) blocks.push(`nono refuses this environment, so the sandbox will not start:\n${refused}`);
+		}
+		// nono can only grant paths that exist. Serebro creates the agent's folders before a run, nothing else.
+		const absent = readWrite
+			.filter((e) => e.source === 'you' || e.source === 'workspace')
+			.map((e) => e.value)
+			.filter((v) => !fs.existsSync(toAbs(v)));
+		if (absent.length)
+			warnings.push(
+				`${absent.join(', ')} ${absent.length === 1 ? 'does' : 'do'} not exist. nono can only grant paths that exist, so the agent will not be able to create ${absent.length === 1 ? 'it' : 'them'}.`
+			);
 		const missing = agentWrites.map((e) => e.value).filter((v) => looksLikeFile(v) && !fs.existsSync(toAbs(v)));
 		if (missing.length)
 			warnings.push(
@@ -347,7 +392,7 @@ export function compilePolicy(
 			readWrite,
 			readOnly,
 			readOnlyNote: nono
-				? 'Apart from these paths the agent can read only system folders (programs, libraries, certificates). The rest of this machine, including your home folder, is hidden. Writes anywhere else are blocked.'
+				? 'Apart from these paths the agent can read only system folders (programs, libraries, certificates); the contents of your home folder and the rest of this machine are hidden, and writing, deleting or renaming anywhere else is blocked. nono does not hide other running programs (their names and command lines are visible, and their environment too when Serebro runs as root), and it does not stop permission changes (chmod) on files you own.'
 				: 'Everything else on this machine is read-only, except the paths listed under "Cannot read". Writes anywhere else are blocked.',
 			denyRead,
 			allowRead,
@@ -418,10 +463,11 @@ export const prepareSandbox = Effect.fn('prepareSandbox')(function* (env: Stored
 	const store = yield* Store;
 	const compiled = yield* compileFor(env);
 	if (compiled.report.blocked) return yield* new SandboxBlocked({ message: compiled.report.blocked });
-	const settingsFile = path.join(
-		yield* store.sandboxDir(env.id),
-		compiled.backend === 'nono' ? 'nono-profile.json' : 'srt-settings.json'
-	);
+	const sandboxDir = yield* store.sandboxDir(env.id);
+	const settingsFile = path.join(sandboxDir, compiled.backend === 'nono' ? 'nono-profile.json' : 'srt-settings.json');
+	// nono writes a small record per command. Keep them with the environment, and only the recent ones.
+	const stateDir = compiled.backend === 'nono' ? path.join(sandboxDir, 'nono-state') : undefined;
+	if (stateDir) yield* Effect.sync(() => pruneOlderThan(path.join(stateDir, 'nono', 'sessions'), 24 * 60 * 60 * 1000));
 	yield* Effect.tryPromise({
 		try: () => fs.promises.writeFile(settingsFile, JSON.stringify(compiled.settings, null, 2), { mode: 0o600 }),
 		catch: (cause) => new FileSystemError({ op: 'write', path: settingsFile, cause })
@@ -438,5 +484,17 @@ export const prepareSandbox = Effect.fn('prepareSandbox')(function* (env: Stored
 			catch: (cause) => new FileSystemError({ op: 'mkdir', path: dir, cause })
 		});
 	}
-	return { compiled, settingsFile };
+	return { compiled, settingsFile, stateDir };
 });
+
+/** Best effort: delete files in `dir` last changed more than `ms` ago. */
+function pruneOlderThan(dir: string, ms: number) {
+	try {
+		for (const name of fs.readdirSync(dir)) {
+			const file = path.join(dir, name);
+			if (Date.now() - fs.statSync(file).mtimeMs > ms) fs.rmSync(file, { recursive: true, force: true });
+		}
+	} catch {
+		// Nothing recorded yet.
+	}
+}
