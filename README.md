@@ -88,6 +88,14 @@ The server code uses [Effect](https://effect.website) v4 (stable modules only) s
 - **Everything crossing a boundary is validated with `Schema`** (`src/lib/server/schemas.ts`): request bodies, and every data file when it is read. A corrupt data file fails loudly and is never overwritten.
 - **`Store`** (`src/lib/server/store.ts`) is an Effect service; its writes run one at a time so concurrent requests cannot lose updates.
 - **Environment variables** are validated at startup (`src/lib/server/config.ts`); a bad value stops the server with a clear message.
+- **Agent turns have limits.** A turn that runs longer than `SEREBRO_TURN_TIMEOUT` (default `60 minutes`), or produces no output for `SEREBRO_IDLE_TIMEOUT` (default `15 minutes`), is stopped and the chat shows why. Use values like `90 minutes`; `Infinity` turns a limit off.
+- **`pnpm check:effect`** runs the [Effect language service](https://github.com/Effect-TS/language-service) diagnostics (unawaited effects, missing `yield*`, unhandled errors, …). The same checks show in your editor once it uses the workspace TypeScript version.
+
+### Tracing (optional)
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` (for example `http://localhost:4318`) to send traces and logs to an OpenTelemetry collector over OTLP/HTTP. Every route, store operation and agent turn is a span. `OTEL_SERVICE_NAME` defaults to `serebro`. Secret values are never put in spans.
+
+This uses Effect's `effect/observability` module, which is still marked unstable. It is only used in `src/lib/server/telemetry.ts`, and it does nothing unless the variable is set.
 
 ## Data
 
@@ -122,6 +130,7 @@ To put it behind your own authenticating proxy, set `SEREBRO_ALLOWED_HOSTS=sereb
 ```bash
 pnpm dev      # dev server
 pnpm build    # production build (adapter-node) → node build
-pnpm check    # type-check
-pnpm test     # unit tests (vitest + @effect/vitest)
+pnpm check          # type-check
+pnpm check:effect   # Effect-specific diagnostics
+pnpm test           # unit tests (vitest + @effect/vitest)
 ```

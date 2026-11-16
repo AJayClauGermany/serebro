@@ -32,12 +32,10 @@ describe('api()', () => {
 	it('hides defects behind a generic 500', async () => {
 		const res = await api(
 			't',
-			Effect.sync(() => {
-				throw new Error('secret internals');
-			})
+			Effect.sync((): unknown => JSON.parse('{"secret internals'))
 		);
 		expect(res.status).toBe(500);
-		expect(JSON.stringify(await res.json())).not.toContain('secret internals');
+		expect(JSON.stringify(await res.json())).not.toContain('secret');
 	});
 });
 

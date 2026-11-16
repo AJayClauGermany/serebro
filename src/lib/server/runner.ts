@@ -6,11 +6,11 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { chat, type StreamChunk } from '@tanstack/ai';
 import { defineSandbox, withSandbox } from '@tanstack/ai-sandbox';
-import { Cause, Duration, Effect } from 'effect';
+import { Cause, Context, Duration, Effect, Stream } from 'effect';
 import type { ProbeResult, SessionView } from '#lib/types.ts';
-import { DATA_DIR } from './config.ts';
+import { DATA_DIR, serverConfig } from './config.ts';
 import { getHarness } from './harnesses.ts';
-import { SandboxBlocked } from './errors.ts';
+import { AgentFailed, AgentTimedOut, SandboxBlocked } from './errors.ts';
 import { prepareSandbox } from './policy.ts';
 import { projectPolicyPath, workspacePath } from './policy-file.ts';
 import type { StoredEnvironment } from './schemas.ts';
@@ -44,36 +44,84 @@ export const runAgent = Effect.fn('runAgent')(function* (opts: {
 		fileEvents: false
 	});
 
+	// The agent gets its own controller: stopping it on a timeout must not also abort the
+	// HTTP response, or the RUN_ERROR explaining why would never reach the browser.
+	const agentAbort = abortFrom(signal);
 	const stream = chat({
 		adapter: harness.createAdapter(session.model),
 		threadId: session.id,
 		messages,
-		abortController: abortFrom(signal),
+		abortController: agentAbort,
 		middleware: [withSandbox(sandbox)],
 		modelOptions: session.agentSessionId ? { sessionId: session.agentSessionId } : {}
 	} as never) as AsyncIterable<StreamChunk>;
 
-	// Remember the harness's own session id so the next turn resumes the agent's context.
-	// Saving it is best effort: a failure is logged and must not cut off the agent's reply.
-	const rememberAgentSession = (agentSessionId: string) =>
-		Effect.runPromise(
-			store.patchSession(session.id, { agentSessionId }).pipe(
+	return superviseAgentStream(stream, {
+		// Run the stream with this request's services, so its logs and spans go where ours do.
+		context: yield* Effect.context(),
+		turnTimeout: serverConfig.turnTimeout,
+		idleTimeout: serverConfig.idleTimeout,
+		stop: () => agentAbort.abort(),
+		attributes: { environment: env.id, session: session.id, harness: harness.id },
+		onChunk: (chunk) => {
+			const c = chunk as { type: string; name?: string; value?: { sessionId?: string } };
+			if (c.type !== 'CUSTOM' || c.name !== harness.sessionEvent || !c.value?.sessionId) return Effect.void;
+			// Remember the harness's own session id so the next turn resumes the agent's context.
+			// Best effort: a failure is logged and must not cut off the agent's reply.
+			return store.patchSession(session.id, { agentSessionId: c.value.sessionId }).pipe(
 				Effect.catchCause((cause) =>
 					Effect.logWarning('Could not save the agent session id; the next turn starts fresh', Cause.pretty(cause))
 				)
-			)
-		);
-
-	return (async function* () {
-		for await (const chunk of stream) {
-			const c = chunk as { type: string; name?: string; value?: { sessionId?: string } };
-			if (c.type === 'CUSTOM' && c.name === harness.sessionEvent && c.value?.sessionId) {
-				await rememberAgentSession(c.value.sessionId);
-			}
-			yield chunk;
+			);
 		}
-	})();
+	});
 });
+
+const runError = (message: string) => ({ type: 'RUN_ERROR', timestamp: Date.now(), message }) as unknown as StreamChunk;
+
+/**
+ * Wrap an agent's event stream with the turn limits and error handling:
+ * - no event for `idleTimeout`, or the turn running past `turnTimeout`, stops the agent;
+ * - an exception from the agent stream is logged with its cause;
+ * in both cases the browser receives one RUN_ERROR event saying what happened.
+ */
+export function superviseAgentStream(
+	source: AsyncIterable<StreamChunk>,
+	opts: {
+		turnTimeout: Duration.Duration;
+		idleTimeout: Duration.Duration;
+		/** Stop the agent process. */
+		stop: () => void;
+		onChunk?: (chunk: StreamChunk) => Effect.Effect<void>;
+		attributes?: Record<string, string>;
+		context?: Context.Context<never>;
+	}
+): AsyncIterable<StreamChunk> {
+	const timedOut = (limit: 'turn' | 'idle', after: Duration.Duration) =>
+		new AgentTimedOut({ limit, after: Duration.format(after) });
+	return Stream.fromAsyncIterable(source, (cause) => new AgentFailed({ cause })).pipe(
+		Stream.tap((chunk) => opts.onChunk?.(chunk) ?? Effect.void),
+		Stream.timeoutOrElse({
+			duration: opts.idleTimeout,
+			orElse: () => Stream.fail(timedOut('idle', opts.idleTimeout))
+		}),
+		Stream.interruptWhen(Effect.sleep(opts.turnTimeout).pipe(Effect.andThen(Effect.fail(timedOut('turn', opts.turnTimeout))))),
+		Stream.catch((e) =>
+			Stream.fromEffect(
+				Effect.sync(opts.stop).pipe(
+					Effect.andThen(
+						e._tag === 'AgentTimedOut'
+							? Effect.logWarning(e.message)
+							: Effect.logError('The agent stream failed', Cause.pretty(Cause.fail(e.cause)))
+					),
+					Effect.as(runError(e.message))
+				)
+			)
+		),
+		Stream.withSpan('agent.turn', { attributes: opts.attributes }),
+		Stream.toAsyncIterableWith(opts.context ?? Context.empty())
+	);
+}
 
 function abortFrom(signal: AbortSignal) {
 	const ac = new AbortController();

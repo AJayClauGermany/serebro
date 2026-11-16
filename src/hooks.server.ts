@@ -70,3 +70,6 @@ export const handleError: HandleServerError = async ({ kind, error, event }) => 
 	if (kind !== 'unknown') return;
 	await runtime.runPromise(Effect.logError(`Unhandled error in ${event.request.method} ${event.url.pathname}`, error));
 };
+
+// adapter-node emits this on SIGINT/SIGTERM. Closing the runtime flushes pending telemetry.
+process.once('sveltekit:shutdown', () => void runtime.dispose());

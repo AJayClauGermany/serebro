@@ -4,7 +4,7 @@
 // message instead of silently falling back to a default.
 
 import path from 'node:path';
-import { Config, Effect } from 'effect';
+import { Config, Duration, Effect } from 'effect';
 
 const ServerConfigSchema = Config.all({
 	dataDir: Config.String('SEREBRO_DATA_DIR').pipe(Config.withDefault(path.join(process.cwd(), '.serebro'))),
@@ -18,7 +18,12 @@ const ServerConfigSchema = Config.all({
 		)
 	),
 	allowRemote: Config.Boolean('SEREBRO_ALLOW_REMOTE').pipe(Config.withDefault(false)),
-	srtBin: Config.String('SEREBRO_SRT_BIN').pipe(Config.option)
+	srtBin: Config.String('SEREBRO_SRT_BIN').pipe(Config.option),
+	// Limits for one agent turn, e.g. "45 minutes". "Infinity" turns a limit off.
+	turnTimeout: Config.Duration('SEREBRO_TURN_TIMEOUT').pipe(Config.withDefault(Duration.minutes(60))),
+	idleTimeout: Config.Duration('SEREBRO_IDLE_TIMEOUT').pipe(Config.withDefault(Duration.minutes(15))),
+	// Send traces and logs to an OpenTelemetry collector (OTLP/HTTP JSON), e.g. http://localhost:4318
+	otlpEndpoint: Config.String('OTEL_EXPORTER_OTLP_ENDPOINT').pipe(Config.option)
 });
 
 export type ServerConfig = Config.Success<typeof ServerConfigSchema>;

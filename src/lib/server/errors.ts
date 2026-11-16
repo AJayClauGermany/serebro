@@ -63,4 +63,28 @@ export class StoreCorrupt extends Schema.TaggedError<StoreCorrupt>()('StoreCorru
 	}
 }
 
+/**
+ * An agent turn ran past a limit. Only raised inside the chat stream (the HTTP response
+ * has already started), where it becomes a RUN_ERROR event, so it is not an `AppError`.
+ */
+export class AgentTimedOut extends Schema.TaggedError<AgentTimedOut>()('AgentTimedOut', {
+	limit: Schema.Literals(['turn', 'idle']),
+	after: Schema.String
+}) {
+	override get message() {
+		return this.limit === 'turn'
+			? `The agent was stopped after running for ${this.after} (SEREBRO_TURN_TIMEOUT).`
+			: `The agent was stopped after ${this.after} without any output (SEREBRO_IDLE_TIMEOUT).`;
+	}
+}
+
+/** The agent's event stream threw. Only raised inside the chat stream. */
+export class AgentFailed extends Schema.TaggedError<AgentFailed>()('AgentFailed', {
+	cause: Schema.Defect()
+}) {
+	override get message() {
+		return this.cause instanceof Error ? this.cause.message : String(this.cause);
+	}
+}
+
 export type AppError = NotFound | InvalidInput | PolicyInvalid | SandboxBlocked | FileSystemError | StoreCorrupt;
