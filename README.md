@@ -17,6 +17,8 @@ pnpm dev
 
 Open http://localhost:5173, click **New environment**, fill it in, then **Run checks** and **New chat**.
 
+New to Serebro? The [user guides](docs/README.md) start with a 20-minute [tutorial](docs/tutorials/first-sandboxed-agent.md) that takes you from install to a working sandboxed agent.
+
 ### Requirements
 
 | | Linux | macOS |
